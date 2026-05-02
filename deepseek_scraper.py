@@ -169,11 +169,18 @@ class DeepSeekScraper:
             self.playwright = sync_playwright().start()
             self.browser = self.playwright.chromium.launch(
                 headless=self.headless,
-                args=["--disable-blink-features=AutomationControlled",
-                      "--no-sandbox", "--disable-dev-shm-usage"],
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--start-maximized",          # open browser maximized
+                ],
             )
+            # ── FIX: viewport=None disables the fixed viewport so the browser
+            #         window controls page size — resizing works naturally. ──
             self.context = self.browser.new_context(
-                viewport={"width": 1280, "height": 900},
+                viewport=None,                    # no fixed viewport → resize works
+                no_viewport=True,                 # explicit opt-out of viewport emulation
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -730,6 +737,8 @@ class DeepSeekScraper:
                     localStorageTotal: lsKeys.length,
                     authRelatedKeys: authKeys,
                     lastMsgPreview: last ? (last.innerText?.substring(0, 200) || '') : 'none',
+                    viewportWidth: window.innerWidth,
+                    viewportHeight: window.innerHeight,
                 };
             }""")
 
@@ -751,6 +760,8 @@ class DeepSeekScraper:
             t.add_row("Last msg think blocks", str(info.get('lastMsgThinkBlocks')))
             t.add_row("localStorage total",    str(info.get('localStorageTotal')))
             t.add_row("Auth-related keys",     str(info.get('authRelatedKeys', [])))
+            t.add_row("Viewport size",
+                      f"{info.get('viewportWidth')}×{info.get('viewportHeight')} px")
             t.add_row("Last 200 chars",
                       f"[muted]{str(info.get('lastMsgPreview',''))[:200]}…[/muted]")
 
