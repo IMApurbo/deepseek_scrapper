@@ -498,13 +498,13 @@ class DeepSeekScraper:
                 var texts = [];
                 for (var i = 0; i < blocks.length; i++) {
                     var c = blocks[i].cloneNode(true);
-                    var junk = c.querySelectorAll("svg,script,style,noscript,button");
+                    var junk = c.querySelectorAll("svg,script,style,noscript,button,span.ds-markdown-cite");
                     for (var j = 0; j < junk.length; j++) junk[j].remove();
                     texts.push(c.outerHTML);
                 }
                 if (texts.length === 0) {
                     var c2 = last.cloneNode(true);
-                    var junk2 = c2.querySelectorAll("svg,script,style,noscript,button");
+                    var junk2 = c2.querySelectorAll("svg,script,style,noscript,button,span.ds-markdown-cite");
                     for (var j = 0; j < junk2.length; j++) junk2[j].remove();
                     texts.push(c2.outerHTML);
                 }
@@ -552,9 +552,14 @@ class DeepSeekScraper:
                 def __init__(self):
                     super().__init__()
                     self.out=[];self.stack=[];self.ignore_depth=0;self.pre_depth=0
-                    self.list_stack=[];self.in_table=False;self.td_buf=[]
+                    self.list_stack=[];self.li_depth=0   # li_depth: are we inside an <li>?
+                    self.in_table=False;self.td_buf=[]
                     self.header_row=False;self.link_buf=[];self.in_link=False
                     self.cell_buf=[];self.in_cell=False
+
+                def _in_li(self):
+                    """True when currently inside a <li> element."""
+                    return self.li_depth > 0
 
                 def handle_starttag(self, tag, attrs):
                     tag=tag.lower(); adict=dict(attrs)
@@ -563,13 +568,20 @@ class DeepSeekScraper:
                     self.stack.append(tag)
                     if tag in ('h1','h2','h3','h4','h5','h6'):
                         self.out.append('\n\n'+'#'*int(tag[1])+' ')
-                    elif tag=='p': self.out.append('\n\n')
+                    elif tag=='p':
+                        # Inside a list item: <p> is just inline spacing, not a block break.
+                        # Emitting \n\n here causes the bullet marker to appear on its own
+                        # line with a blank gap before the text — the visual bug we're fixing.
+                        if not self._in_li():
+                            self.out.append('\n\n')
+                        # else: do nothing — content flows inline after the bullet
                     elif tag in ('ul','ol'): self.list_stack.append([tag,0]); self.out.append('\n')
                     elif tag=='li':
+                        self.li_depth+=1
                         if self.list_stack:
                             k,_=self.list_stack[-1]
                             if k=='ol': self.list_stack[-1][1]+=1; p=f"{self.list_stack[-1][1]}. "
-                            else: p='• '
+                            else: p='- '
                             self.out.append(f'\n{"  "*(len(self.list_stack)-1)}{p}')
                     elif tag=='blockquote': self.out.append('\n\n> ')
                     elif tag=='pre': self.pre_depth+=1; self.out.append('\n\n```')
@@ -581,7 +593,9 @@ class DeepSeekScraper:
                     elif tag in self.UNDER: self.out.append('__')
                     elif tag=='a':
                         self.stack[-1]=('a',adict.get('href','')); self.in_link=True; self.link_buf=[]
-                    elif tag=='br': self.out.append('  \n')
+                    elif tag=='br':
+                        # Inside a list item a <br> should just be a space, not a line break
+                        self.out.append(' ' if self._in_li() else '  \n')
                     elif tag=='hr': self.out.append('\n\n---\n\n')
                     elif tag=='table': self.in_table=True; self.out.append('\n\n')
                     elif tag=='tr': self.td_buf=[]
@@ -599,7 +613,13 @@ class DeepSeekScraper:
                     else: return
                     if self.ignore_depth: self.ignore_depth-=1; return
                     if tag in ('h1','h2','h3','h4','h5','h6'): self.out.append('\n')
-                    elif tag=='p': self.out.append('\n')
+                    elif tag=='p':
+                        # Mirror the open-tag logic: suppress block break inside <li>
+                        if not self._in_li():
+                            self.out.append('\n')
+                        # else: nothing — no trailing newline that would split the bullet
+                    elif tag=='li':
+                        self.li_depth=max(0, self.li_depth-1)
                     elif tag in ('ul','ol'):
                         if self.list_stack: self.list_stack.pop()
                         self.out.append('\n')
@@ -652,8 +672,15 @@ class DeepSeekScraper:
                     except: pass
 
                 def get_md(self):
-                    return re.sub(r'\n{3,}','\n\n',
-                                  ''.join(str(x) for x in self.out)).strip()
+                    raw = ''.join(str(x) for x in self.out)
+                    # Collapse 3+ newlines to 2
+                    raw = re.sub(r'\n{3,}', '\n\n', raw)
+                    # Remove blank lines between a list marker line and its continuation
+                    # e.g.  "- \n\nSome text" → "- Some text"
+                    raw = re.sub(r'((?:^|\n)[ \t]*[-\d]+[.)>]? *)\n\n+', r'\1', raw)
+                    # Trim trailing whitespace per line
+                    raw = '\n'.join(line.rstrip() for line in raw.split('\n'))
+                    return raw.strip()
 
             p = _MDParser(); p.feed(html); return p.get_md()
         except:
