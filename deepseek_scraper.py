@@ -121,9 +121,9 @@ def spinner_ctx(message: str, style: str = "#60A5FA"):
     return Live(renderable, console=console, refresh_per_second=12, transient=True)
 
 
-def render_response(md_text: str, was_thinking: bool, elapsed: float):
+def render_response(md_text: str, reasoning_blocks: list, elapsed: float):
     tags = ["[ai_label]🐋 DeepSeek[/ai_label]"]
-    if was_thinking:
+    if reasoning_blocks:
         tags.append("[think_label]💭 Thought[/think_label]")
     title = "  ".join(tags) + f"  [muted]({elapsed:.1f}s)[/muted]"
     console.print(Panel(
@@ -135,13 +135,17 @@ def render_response(md_text: str, was_thinking: bool, elapsed: float):
     console.print()
 
 
-def render_thinking(thinking_text: str):
-    console.print(Panel(
-        Padding(Text(thinking_text, style="muted italic"), (1, 2)),
-        title="[think_label]💭 Reasoning[/think_label]", title_align="left",
-        border_style="think_label", box=box.ROUNDED,
-    ))
-    console.print()
+def render_thinking(reasoning_blocks: list):
+    """Render each reasoning block as its own numbered panel."""
+    total = len(reasoning_blocks)
+    for i, block in enumerate(reasoning_blocks, 1):
+        label = f"💭 Reasoning{f' [{i}/{total}]' if total > 1 else ''}"
+        console.print(Panel(
+            Padding(Markdown(block, code_theme="monokai"), (1, 2)),
+            title=f"[think_label]{label}[/think_label]", title_align="left",
+            border_style="think_label", box=box.ROUNDED,
+        ))
+        console.print()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -150,8 +154,16 @@ def render_thinking(thinking_text: str):
 
 class DeepSeekScraper:
     INPUT_SEL    = "textarea._27c9245"
-    STOP_BTN_SEL = "button._52c986b.bd74640a"
     MSG_SEL      = "div.ds-message._63c77b1"
+
+    # Stop button class anatomy (observed from DOM):
+    #   idle/done  → class="_52c986b bd74640a ds-icon-button ... ds-icon-button--disabled"
+    #                aria-disabled="true"
+    #   generating → class="_52c986b ds-icon-button ... "   (bd74640a is GONE)
+    #                aria-disabled="false"
+    #
+    # So: ACTIVE = has ._52c986b but NOT .bd74640a (the bd74640a class is the "done" marker)
+    STOP_BTN_ACTIVE_SEL = "div._52c986b:not(.bd74640a)"
 
     def __init__(self, headless: bool = False):
         self.headless   = headless
@@ -387,9 +399,9 @@ class DeepSeekScraper:
     # ─────────────────────────────────────────────────────────
 
     def send_message(self, message: str) -> tuple:
-        """Returns (md_response, thinking_md, elapsed)."""
+        """Returns (md_response, reasoning_blocks: list[str], elapsed)."""
         if not self.page:
-            return ("[Error] Browser not started.", "", 0.0)
+            return ("[Error] Browser not started.", [], 0.0)
         try:
             inp = self.page.locator(self.INPUT_SEL)
             inp.click()
@@ -401,22 +413,27 @@ class DeepSeekScraper:
             self._wait_for_response_complete(timeout=300)
             elapsed = time.time() - t0
 
-            md, thinking = self._scrape_last_response()
-            return (md, thinking, elapsed)
+            md, reasoning_blocks = self._scrape_last_response()
+            return (md, reasoning_blocks, elapsed)
         except Exception as e:
-            return (f"[Error] {e}", "", 0.0)
+            return (f"[Error] {e}", [], 0.0)
 
     # ─────────────────────────────────────────────────────────
     # Wait Logic
     # ─────────────────────────────────────────────────────────
 
     def _stop_btn_active(self) -> bool:
-        """True while DeepSeek is generating (stop button aria-disabled=false)."""
+        """True while DeepSeek is generating.
+
+        Class changes observed live:
+          idle/done  → ._52c986b.bd74640a  + ds-icon-button--disabled  aria-disabled=true
+          generating → ._52c986b           (bd74640a class REMOVED)    aria-disabled=false
+
+        So active generation = ._52c986b exists WITHOUT .bd74640a
+        Once bd74640a reappears the response is fully complete — grab immediately.
+        """
         try:
-            btn = self.page.locator(self.STOP_BTN_SEL).first
-            if btn.count() == 0:
-                return False
-            return btn.get_attribute("aria-disabled") == "false"
+            return self.page.locator(self.STOP_BTN_ACTIVE_SEL).count() > 0
         except:
             return False
 
@@ -463,21 +480,16 @@ class DeepSeekScraper:
 
     def _scrape_last_response(self) -> tuple:
         """
-        Returns (response_md, thinking_md).
+        Returns (response_md, reasoning_blocks: list[str]).
 
-        Rules (per spec):
-          - Get last div.ds-message._63c77b1
-          - Count div.ds-markdown blocks inside it:
-            1 block  -> plain response, no thinking
-            2 blocks -> [0]=thinking, [1]=response
-            3+ blocks-> [0..n-2]=reasoning joined, [-1]=response
+        DOM layout inside the last ds-message:
+          - 1 ds-markdown block  → plain response, no reasoning
+          - 2+ ds-markdown blocks → blocks[:-1] are reasoning steps, blocks[-1] is response
 
-        NOTE: We return innerText (plain text) from JS, not innerHTML, to avoid
-        SyntaxError from backticks/special chars in HTML breaking the JS string.
-        The html2text conversion then happens on the raw outer HTML fetched separately.
+        Each reasoning block is returned individually so the UI can render them
+        as separate panels (matching what DeepSeek actually shows in the browser).
         """
         try:
-            # Step 1: get block count and plain text safely via JS
             info = self.page.evaluate("""() => {
                 var msgs = document.querySelectorAll("div.ds-message._63c77b1");
                 if (!msgs.length) return { count: 0, texts: [] };
@@ -503,20 +515,19 @@ class DeepSeekScraper:
             count = info.get("count", 0)
 
             if not texts:
-                return ("[Error] Empty response", "")
+                return ("[Error] Empty response", [])
 
             if count <= 1:
-                # Single block or fallback: just the response
-                response_md = self._html_to_md(texts[0])
-                return (response_md or "[Error] Empty response", "")
+                # Single block → pure response, no reasoning
+                return (self._html_to_md(texts[0]) or "[Error] Empty response", [])
             else:
-                # Last = response, everything before = reasoning
-                response_md = self._html_to_md(texts[-1])
-                thinking_md = self._html_to_md(" ".join(texts[:-1]))
-                return (response_md or "[Error] Empty response", thinking_md)
+                # All blocks except the last are reasoning steps; last is the answer
+                response_md      = self._html_to_md(texts[-1])
+                reasoning_blocks = [self._html_to_md(h) for h in texts[:-1] if h.strip()]
+                return (response_md or "[Error] Empty response", reasoning_blocks)
 
         except Exception as e:
-            return (f"[Error] {e}", "")
+            return (f"[Error] {e}", [])
 
     def _html_to_md(self, html: str) -> str:
         if not html or not html.strip():
@@ -852,10 +863,10 @@ def main():
 
                 # ── Send & render ──────────────────────────────
                 console.print()
-                md, thinking, elapsed = scraper.send_message(user_input)
-                if thinking:
-                    render_thinking(thinking)
-                render_response(md, bool(thinking), elapsed)
+                md, reasoning_blocks, elapsed = scraper.send_message(user_input)
+                if reasoning_blocks:
+                    render_thinking(reasoning_blocks)
+                render_response(md, reasoning_blocks, elapsed)
 
             except KeyboardInterrupt:
                 console.print("\n[muted]  Interrupted.[/muted]")
