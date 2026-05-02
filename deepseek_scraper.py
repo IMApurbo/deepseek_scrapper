@@ -44,7 +44,11 @@ except ImportError:
 # ── Persistent session directory ──────────────────────────────
 SESSION_DIR  = Path.home() / ".deepseek_scraper"
 COOKIES_FILE = SESSION_DIR / "cookies.json"
+STORAGE_FILE = SESSION_DIR / "storage.json"   # localStorage + sessionStorage
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+# Far-future expiry (year 2099) — forces session cookies to persist across launches
+FAR_FUTURE = 4070908800
 
 # ── Theme ─────────────────────────────────────────────────────
 THEME = Theme({
@@ -122,7 +126,6 @@ def render_response(md_text: str, was_thinking: bool, elapsed: float):
     if was_thinking:
         tags.append("[think_label]💭 Thought[/think_label]")
     title = "  ".join(tags) + f"  [muted]({elapsed:.1f}s)[/muted]"
-
     console.print(Panel(
         Padding(Markdown(md_text, code_theme="monokai", hyperlinks=True), (1, 2)),
         title=title, title_align="left",
@@ -146,13 +149,9 @@ def render_thinking(thinking_text: str):
 # ─────────────────────────────────────────────────────────────
 
 class DeepSeekScraper:
-    # ── Selectors ─────────────────────────────────────────────
     INPUT_SEL    = "textarea._27c9245"
-    STOP_BTN_SEL = "button._52c986b.bd74640a"          # aria-disabled flips true→false→true
+    STOP_BTN_SEL = "button._52c986b.bd74640a"
     MSG_SEL      = "div.ds-message._63c77b1"
-    DS_MARKDOWN  = "div.ds-markdown"
-    THINK_SEL    = "div.e1675d8b.ds-think-content._767406f"
-    PARA_SEL     = "p.ds-markdown-paragraph"
 
     def __init__(self, headless: bool = False):
         self.headless   = headless
@@ -161,7 +160,9 @@ class DeepSeekScraper:
         self.page       = None
         self.playwright = None
 
-    # ── Browser Setup ─────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # Browser Setup
+    # ─────────────────────────────────────────────────────────
 
     def start(self):
         with spinner_ctx("Launching Chromium…"):
@@ -183,14 +184,25 @@ class DeepSeekScraper:
             self.page = self.context.new_page()
         console.print("[success]✔[/success]  Browser launched")
 
-        # ── Load saved cookies if they exist ──────────────────
+        # Step 1: inject saved cookies into context BEFORE navigation
         self._load_cookies_silent()
 
+        # Step 2: navigate to site
         with spinner_ctx("Loading chat.deepseek.com…"):
-            self.page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded", timeout=30000)
+            self.page.goto("https://chat.deepseek.com/",
+                           wait_until="domcontentloaded", timeout=30000)
         console.print("[success]✔[/success]  Page loaded")
 
-        # ── Auth check ────────────────────────────────────────
+        # Step 3: restore localStorage/sessionStorage (must happen AFTER navigation,
+        #         as storage is origin-scoped and needs a live page context)
+        restored = self._restore_storage()
+        if restored:
+            with spinner_ctx("Applying saved session…"):
+                # Reload so React/auth state picks up restored tokens
+                self.page.reload(wait_until="domcontentloaded", timeout=20000)
+                time.sleep(1.2)
+
+        # Step 4: check auth
         self._handle_auth()
         self._handle_captcha()
 
@@ -198,32 +210,125 @@ class DeepSeekScraper:
             self._wait_for_input()
         console.print("[success]✔[/success]  Chat input ready\n")
 
-    # ── Cookie persistence ────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # Session Persistence
+    # ─────────────────────────────────────────────────────────
 
     def _load_cookies_silent(self):
-        if COOKIES_FILE.exists():
-            try:
-                cookies = json.loads(COOKIES_FILE.read_text())
-                self.context.add_cookies(cookies)
-                console.print(f"[success]✔[/success]  Cookies loaded from [muted]{COOKIES_FILE}[/muted]")
-            except Exception as e:
-                console.print(f"[warning]⚠  Could not load cookies: {e}[/warning]")
+        """Inject saved cookies into Playwright context before first navigation."""
+        if not COOKIES_FILE.exists():
+            return
+        try:
+            raw = json.loads(COOKIES_FILE.read_text())
+            cleaned = []
+            for c in raw:
+                # Playwright requires sameSite to be Strict / Lax / None
+                ss = c.get("sameSite", "Lax")
+                if ss not in ("Strict", "Lax", "None"):
+                    c["sameSite"] = "Lax"
+                # Promote session-only cookies (expires -1) to persistent
+                if c.get("expires", -1) in (-1, 0, None):
+                    c["expires"] = FAR_FUTURE
+                cleaned.append(c)
+            self.context.add_cookies(cleaned)
+            console.print(
+                f"[success]✔[/success]  Cookies loaded "
+                f"([muted]{len(cleaned)} cookies[/muted])"
+            )
+        except Exception as e:
+            console.print(f"[warning]⚠  Could not load cookies: {e}[/warning]")
 
-    def _save_cookies(self):
+    def _restore_storage(self) -> bool:
+        """Inject saved localStorage/sessionStorage into current page.
+        Returns True if any data was restored."""
+        if not STORAGE_FILE.exists():
+            return False
+        try:
+            data = json.loads(STORAGE_FILE.read_text())
+            local   = data.get("localStorage",   {})
+            session = data.get("sessionStorage",  {})
+            if not local and not session:
+                return False
+
+            self.page.evaluate("""(state) => {
+                try {
+                    for (const [k, v] of Object.entries(state.localStorage || {})) {
+                        localStorage.setItem(k, v);
+                    }
+                    for (const [k, v] of Object.entries(state.sessionStorage || {})) {
+                        sessionStorage.setItem(k, v);
+                    }
+                } catch(e) { console.warn('storage restore error', e); }
+            }""", {"localStorage": local, "sessionStorage": session})
+
+            console.print(
+                f"[success]✔[/success]  Storage restored "
+                f"([muted]{len(local)} local, {len(session)} session keys[/muted])"
+            )
+            return True
+        except Exception as e:
+            console.print(f"[warning]⚠  Could not restore storage: {e}[/warning]")
+            return False
+
+    def _page_is_deepseek(self) -> bool:
+        """True only when current page is on deepseek.com (localStorage accessible)."""
+        try:
+            url = self.page.url
+            return "deepseek.com" in url and not url.startswith("about:")
+        except:
+            return False
+
+    def _save_session(self):
+        """Persist cookies (bumped to far-future) + localStorage + sessionStorage."""
+        errors = []
+
+        # Cookies (always safe — read from context, not from page)
         try:
             cookies = self.context.cookies()
+            for c in cookies:
+                if c.get("expires", -1) in (-1, 0, None):
+                    c["expires"] = FAR_FUTURE
+                ss = c.get("sameSite", "Lax")
+                if ss not in ("Strict", "Lax", "None"):
+                    c["sameSite"] = "Lax"
             COOKIES_FILE.write_text(json.dumps(cookies, indent=2))
-            console.print(f"[success]✔[/success]  Cookies saved → [muted]{COOKIES_FILE}[/muted]")
         except Exception as e:
-            console.print(f"[warning]⚠  Could not save cookies: {e}[/warning]")
+            errors.append(f"cookies: {e}")
 
-    # ── Auth / Captcha ────────────────────────────────────────
+        # localStorage + sessionStorage — only accessible when on deepseek.com origin.
+        # Calling this on about:blank or a redirect raises SecurityError.
+        if self._page_is_deepseek():
+            try:
+                storage = self.page.evaluate("""() => {
+                    const safe = (fn) => { try { return fn(); } catch(e) { return {}; } };
+                    return {
+                        localStorage: safe(() => Object.fromEntries(
+                            Object.keys(localStorage).map(k => [k, localStorage.getItem(k)])
+                        )),
+                        sessionStorage: safe(() => Object.fromEntries(
+                            Object.keys(sessionStorage).map(k => [k, sessionStorage.getItem(k)])
+                        )),
+                    };
+                }""")
+                total = len(storage.get("localStorage", {})) + len(storage.get("sessionStorage", {}))
+                if total > 0:
+                    STORAGE_FILE.write_text(json.dumps(storage, indent=2))
+            except Exception as e:
+                errors.append(f"storage: {e}")
+
+        if errors:
+            console.print(f"[warning]⚠  Session saved with warnings: {', '.join(errors)}[/warning]")
+        else:
+            console.print(f"[success]✔[/success]  Session saved → [muted]{SESSION_DIR}[/muted]")
+
+    # ─────────────────────────────────────────────────────────
+    # Auth / Captcha
+    # ─────────────────────────────────────────────────────────
 
     def _handle_auth(self):
         time.sleep(1.5)
         url = self.page.url
-        # DeepSeek redirects to /sign_in when not logged in
-        if any(x in url for x in ["/sign_in", "/login", "/auth", "login"]):
+        if any(x in url for x in ["/sign_in", "/login", "/auth"]):
             console.print(Panel(
                 f"[warning]Login required.[/warning]\n[muted]{url}[/muted]\n\n"
                 "Log in inside the browser window.\n"
@@ -233,14 +338,18 @@ class DeepSeekScraper:
             ))
             input()
             try:
-                self.page.wait_for_url("**/", timeout=60000)
+                self.page.wait_for_function(
+                    "() => !window.location.href.includes('/sign_in')",
+                    timeout=60000,
+                )
             except:
                 pass
-            # Save cookies so next launch skips login
-            self._save_cookies()
+            time.sleep(1.5)
+            # Save immediately after successful login
+            self._save_session()
         else:
-            # Already logged in — refresh cookies silently
-            self._save_cookies()
+            # Already authenticated — refresh saved session
+            self._save_session()
 
     def _handle_captcha(self):
         for sig in ["iframe[src*='recaptcha']", "iframe[src*='captcha']",
@@ -254,7 +363,7 @@ class DeepSeekScraper:
                         border_style="warning", box=box.ROUNDED,
                     ))
                     input()
-                    self._save_cookies()
+                    self._save_session()
                     return
             except:
                 pass
@@ -266,18 +375,20 @@ class DeepSeekScraper:
             console.print("[error]✘  Input not found — page may need login[/error]")
             console.print(f"[muted]   {self.page.url}[/muted]")
 
-    # ── Core: Send Message ────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # Core: Send Message
+    # ─────────────────────────────────────────────────────────
 
     def send_message(self, message: str) -> tuple:
-        """Returns (md_response, thinking_md, elapsed)"""
+        """Returns (md_response, thinking_md, elapsed)."""
         if not self.page:
             return ("[Error] Browser not started.", "", 0.0)
         try:
-            box_ = self.page.locator(self.INPUT_SEL)
-            box_.click()
-            box_.fill(message)
+            inp = self.page.locator(self.INPUT_SEL)
+            inp.click()
+            inp.fill(message)
             time.sleep(0.15)
-            box_.press("Enter")
+            inp.press("Enter")
 
             t0 = time.time()
             self._wait_for_response_complete(timeout=300)
@@ -288,19 +399,17 @@ class DeepSeekScraper:
         except Exception as e:
             return (f"[Error] {e}", "", 0.0)
 
-    # ── Wait Logic ────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # Wait Logic
+    # ─────────────────────────────────────────────────────────
 
-    def _stop_btn_sending(self) -> bool:
-        """
-        Returns True while DeepSeek is generating.
-        The stop button has aria-disabled="false" during generation.
-        """
+    def _stop_btn_active(self) -> bool:
+        """True while DeepSeek is generating (stop button aria-disabled=false)."""
         try:
             btn = self.page.locator(self.STOP_BTN_SEL).first
             if btn.count() == 0:
                 return False
-            disabled = btn.get_attribute("aria-disabled")
-            return disabled == "false"
+            return btn.get_attribute("aria-disabled") == "false"
         except:
             return False
 
@@ -313,79 +422,92 @@ class DeepSeekScraper:
         with Live(_spin("Waiting for DeepSeek…"), console=console,
                   refresh_per_second=12, transient=True) as live:
 
-            # 1. Wait until the stop button appears (generation started)
-            start_wait = time.time() + 10
-            while time.time() < start_wait:
-                if self._stop_btn_sending():
+            # Wait up to 10s for generation to start
+            start_deadline = time.time() + 10
+            while time.time() < start_deadline:
+                if self._stop_btn_active():
                     break
                 time.sleep(0.2)
 
             live.update(_spin("Generating response…"))
 
-            # 2. Wait until stop button disappears / aria-disabled becomes "true"
+            # Wait for generation to finish
             while time.time() < deadline:
-                if not self._stop_btn_sending():
+                if not self._stop_btn_active():
                     live.update(Text(""))
                     return
-                # Update label if thinking is in progress
-                think_count = self.page.locator(self.THINK_SEL).count()
-                if think_count > 0:
-                    live.update(_spin("Reasoning…", "#FCD34D"))
+                try:
+                    think_count = self.page.locator(
+                        "div.e1675d8b.ds-think-content._767406f"
+                    ).count()
+                    if think_count > 0:
+                        live.update(_spin("Reasoning…", "#FCD34D"))
+                    else:
+                        live.update(_spin("Generating response…"))
+                except:
+                    pass
                 time.sleep(0.25)
 
         console.print("[warning]⚠  Response timed out.[/warning]")
 
-    # ── Scraping ──────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # Scraping
+    # ─────────────────────────────────────────────────────────
 
     def _scrape_last_response(self) -> tuple:
         """
         Returns (response_md, thinking_md).
 
-        Logic per spec:
-        - Find all .ds-message._63c77b1 → take the last one (assistant reply)
-        - Inside it count div.ds-markdown blocks
-          • 1 block  → direct response, no thinking
-          • 2 blocks → [0]=thinking, [1]=response
-          • 3+ blocks→ [0..n-2]=reasoning, [-1]=response
+        Rules (per spec):
+          - Get last div.ds-message._63c77b1
+          - Count div.ds-markdown blocks inside it:
+            1 block  -> plain response, no thinking
+            2 blocks -> [0]=thinking, [1]=response
+            3+ blocks-> [0..n-2]=reasoning joined, [-1]=response
+
+        NOTE: We return innerText (plain text) from JS, not innerHTML, to avoid
+        SyntaxError from backticks/special chars in HTML breaking the JS string.
+        The html2text conversion then happens on the raw outer HTML fetched separately.
         """
         try:
-            html_result = self.page.evaluate(f"""() => {{
-                const messages = document.querySelectorAll('div.ds-message._63c77b1');
-                if (!messages.length) return {{ response: '', thinking: '' }};
+            # Step 1: get block count and plain text safely via JS
+            info = self.page.evaluate("""() => {
+                var msgs = document.querySelectorAll("div.ds-message._63c77b1");
+                if (!msgs.length) return { count: 0, texts: [] };
+                var last = msgs[msgs.length - 1];
+                var blocks = last.querySelectorAll("div.ds-markdown");
+                var texts = [];
+                for (var i = 0; i < blocks.length; i++) {
+                    var c = blocks[i].cloneNode(true);
+                    var junk = c.querySelectorAll("svg,script,style,noscript,button");
+                    for (var j = 0; j < junk.length; j++) junk[j].remove();
+                    texts.push(c.outerHTML);
+                }
+                if (texts.length === 0) {
+                    var c2 = last.cloneNode(true);
+                    var junk2 = c2.querySelectorAll("svg,script,style,noscript,button");
+                    for (var j = 0; j < junk2.length; j++) junk2[j].remove();
+                    texts.push(c2.outerHTML);
+                }
+                return { count: blocks.length, texts: texts };
+            }""")
 
-                const last = messages[messages.length - 1];
-                const mdBlocks = Array.from(last.querySelectorAll('div.ds-markdown'));
+            texts = info.get("texts", [])
+            count = info.get("count", 0)
 
-                function cleanBlock(el) {{
-                    const clone = el.cloneNode(true);
-                    clone.querySelectorAll('svg,script,style,noscript,button').forEach(e => e.remove());
-                    return clone.innerHTML.trim();
-                }}
+            if not texts:
+                return ("[Error] Empty response", "")
 
-                let responseHtml = '';
-                let thinkingHtml = '';
+            if count <= 1:
+                # Single block or fallback: just the response
+                response_md = self._html_to_md(texts[0])
+                return (response_md or "[Error] Empty response", "")
+            else:
+                # Last = response, everything before = reasoning
+                response_md = self._html_to_md(texts[-1])
+                thinking_md = self._html_to_md(" ".join(texts[:-1]))
+                return (response_md or "[Error] Empty response", thinking_md)
 
-                if (mdBlocks.length === 0) {{
-                    responseHtml = cleanBlock(last);
-                }} else if (mdBlocks.length === 1) {{
-                    responseHtml = cleanBlock(mdBlocks[0]);
-                }} else {{
-                    // Last block is always the response
-                    responseHtml = cleanBlock(mdBlocks[mdBlocks.length - 1]);
-                    // Everything before is reasoning
-                    const reasonParts = [];
-                    for (let i = 0; i < mdBlocks.length - 1; i++) {{
-                        reasonParts.push(cleanBlock(mdBlocks[i]));
-                    }}
-                    thinkingHtml = reasonParts.join('\\n');
-                }}
-
-                return {{ response: responseHtml, thinking: thinkingHtml }};
-            }}""")
-
-            response_md = self._html_to_md(html_result.get("response", ""))
-            thinking_md = self._html_to_md(html_result.get("thinking", ""))
-            return (response_md or "[Error] Empty response", thinking_md)
         except Exception as e:
             return (f"[Error] {e}", "")
 
@@ -398,7 +520,7 @@ class DeepSeekScraper:
             except:
                 pass
 
-        # Fallback minimal HTML→MD parser
+        # Fallback minimal HTML-to-Markdown parser
         try:
             from html.parser import HTMLParser
 
@@ -427,7 +549,7 @@ class DeepSeekScraper:
                     elif tag in ('ul','ol'): self.list_stack.append([tag,0]); self.out.append('\n')
                     elif tag=='li':
                         if self.list_stack:
-                            k,c=self.list_stack[-1]
+                            k,_=self.list_stack[-1]
                             if k=='ol': self.list_stack[-1][1]+=1; p=f"{self.list_stack[-1][1]}. "
                             else: p='• '
                             self.out.append(f'\n{"  "*(len(self.list_stack)-1)}{p}')
@@ -480,7 +602,9 @@ class DeepSeekScraper:
                         elif href: self.out.append(href)
                         self.link_buf=[]
                     elif tag in ('td','th'):
-                        self.in_cell=False; self.td_buf.append(''.join(self.cell_buf).strip()); self.cell_buf=[]
+                        self.in_cell=False
+                        self.td_buf.append(''.join(self.cell_buf).strip())
+                        self.cell_buf=[]
                     elif tag=='tr':
                         self.out.append(f'| {" | ".join(self.td_buf)} |\n')
                         if self.header_row:
@@ -503,20 +627,25 @@ class DeepSeekScraper:
                     self.out.append(e.get(name, f'&{name};'))
 
                 def handle_charref(self, name):
-                    try: self.out.append(chr(int(name[1:],16) if name.startswith('x') else int(name)))
+                    try:
+                        self.out.append(
+                            chr(int(name[1:],16) if name.startswith('x') else int(name))
+                        )
                     except: pass
 
                 def get_md(self):
-                    return re.sub(r'\n{3,}','\n\n',''.join(str(x) for x in self.out)).strip()
+                    return re.sub(r'\n{3,}','\n\n',
+                                  ''.join(str(x) for x in self.out)).strip()
 
             p = _MDParser(); p.feed(html); return p.get_md()
         except:
             return re.sub(r'<[^>]+>', '', html).strip()
 
-    # ── New Chat ──────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # New Chat
+    # ─────────────────────────────────────────────────────────
 
     def new_chat(self):
-        # Try clicking "New Chat" button
         for sel in [
             "button[aria-label*='new' i]",
             "button[aria-label*='New' i]",
@@ -524,7 +653,6 @@ class DeepSeekScraper:
             "button:has-text('New chat')",
             "[class*='new-chat']",
             "a[href='/']",
-            "a[href='']",
         ]:
             try:
                 btn = self.page.locator(sel).first
@@ -538,85 +666,72 @@ class DeepSeekScraper:
                 continue
 
         with spinner_ctx("Starting new chat…"):
-            self.page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded", timeout=15000)
+            self.page.goto("https://chat.deepseek.com/",
+                           wait_until="domcontentloaded", timeout=15000)
             self._wait_for_input()
         console.print("[success]✔[/success]  New conversation started.")
 
-    # ── Conversation History ──────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # Conversation History
+    # ─────────────────────────────────────────────────────────
 
     def get_full_conversation(self) -> list:
-        """
-        Returns list of {role, content} dicts.
-        User messages: look for common user-bubble selectors.
-        Assistant messages: every ds-message block scraped.
-        """
         try:
-            return self.page.evaluate(f"""() => {{
+            return self.page.evaluate("""() => {
                 const history = [];
-
-                // User messages — try common DeepSeek selectors
-                const userSelectors = [
-                    '[class*="user-message"]',
-                    '[class*="human-message"]',
-                    '[data-role="user"]',
-                    '[class*="chat-input-area"] .message',
-                ];
-                let userMsgs = [];
-                for (const sel of userSelectors) {{
-                    const els = document.querySelectorAll(sel);
-                    if (els.length > 0) {{
-                        userMsgs = Array.from(els).map(e => e.innerText?.trim() || '');
-                        break;
-                    }}
-                }}
-
-                // Assistant messages
                 const msgs = document.querySelectorAll('div.ds-message._63c77b1');
-                msgs.forEach(msg => {{
+                msgs.forEach(msg => {
                     const mdBlocks = Array.from(msg.querySelectorAll('div.ds-markdown'));
-                    let html = '';
-                    if (mdBlocks.length === 0) {{
-                        html = msg.innerHTML;
-                    }} else {{
-                        html = mdBlocks[mdBlocks.length - 1].innerHTML;
-                    }}
-                    const clone = document.createElement('div');
-                    clone.innerHTML = html;
+                    const el = mdBlocks.length ? mdBlocks[mdBlocks.length - 1] : msg;
+                    const clone = el.cloneNode(true);
                     clone.querySelectorAll('svg,script,style,noscript,button').forEach(e => e.remove());
-                    history.push({{ role: 'assistant', content: clone.innerHTML.trim() }});
-                }});
-
-                userMsgs.forEach(t => {{
-                    if (t) history.push({{ role: 'user', content: t }});
-                }});
-
+                    history.push({ role: 'assistant', content: clone.innerHTML.trim() });
+                });
+                for (const sel of ['[class*="user-message"]','[class*="human-message"]',
+                                    '[data-role="user"]']) {
+                    const els = document.querySelectorAll(sel);
+                    if (els.length) {
+                        els.forEach(e => history.push({
+                            role: 'user', content: e.innerText?.trim() || ''
+                        }));
+                        break;
+                    }
+                }
                 return history;
-            }}""") or []
+            }""") or []
         except Exception as e:
             console.print(f"[error]History error: {e}[/error]")
             return []
 
-    # ── DOM Debug ─────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # DOM Debug
+    # ─────────────────────────────────────────────────────────
 
     def debug_dom(self):
         try:
-            info = self.page.evaluate(f"""() => {{
+            info = self.page.evaluate("""() => {
                 const stopBtn = document.querySelector('button._52c986b.bd74640a');
                 const msgs = document.querySelectorAll('div.ds-message._63c77b1');
                 const last = msgs.length ? msgs[msgs.length - 1] : null;
-                const mdBlocks = last ? last.querySelectorAll('div.ds-markdown').length : 0;
-                const thinkBlocks = last ? last.querySelectorAll('div.e1675d8b.ds-think-content._767406f').length : 0;
-                return {{
+                const lsKeys = Object.keys(localStorage);
+                const authKeys = lsKeys.filter(k =>
+                    /token|auth|user|session/i.test(k)
+                );
+                return {
                     url: window.location.href,
                     inputExists: !!document.querySelector('textarea._27c9245'),
                     stopBtnExists: !!stopBtn,
                     stopBtnAriaDisabled: stopBtn ? stopBtn.getAttribute('aria-disabled') : null,
                     dsMessageCount: msgs.length,
-                    lastMsgMdBlocks: mdBlocks,
-                    lastMsgThinkBlocks: thinkBlocks,
+                    lastMsgMdBlocks: last ? last.querySelectorAll('div.ds-markdown').length : 0,
+                    lastMsgThinkBlocks: last
+                        ? last.querySelectorAll('div.e1675d8b.ds-think-content._767406f').length
+                        : 0,
+                    localStorageTotal: lsKeys.length,
+                    authRelatedKeys: authKeys,
                     lastMsgPreview: last ? (last.innerText?.substring(0, 200) || '') : 'none',
-                }};
-            }}""")
+                };
+            }""")
 
             t = Table(
                 title="[primary]DOM State[/primary]",
@@ -634,18 +749,22 @@ class DeepSeekScraper:
             t.add_row(".ds-message count",     str(info.get('dsMessageCount')))
             t.add_row("Last msg ds-markdown",  str(info.get('lastMsgMdBlocks')) + " blocks")
             t.add_row("Last msg think blocks", str(info.get('lastMsgThinkBlocks')))
-            t.add_row("Last 200 chars",        f"[muted]{info.get('lastMsgPreview','')[:200]}…[/muted]")
+            t.add_row("localStorage total",    str(info.get('localStorageTotal')))
+            t.add_row("Auth-related keys",     str(info.get('authRelatedKeys', [])))
+            t.add_row("Last 200 chars",
+                      f"[muted]{str(info.get('lastMsgPreview',''))[:200]}…[/muted]")
 
             console.print(); console.print(t); console.print()
         except Exception as e:
             console.print(f"[error]Debug error: {e}[/error]")
 
-    # ── Cleanup ───────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # Cleanup
+    # ─────────────────────────────────────────────────────────
 
     def close(self):
         try:
-            # Always persist cookies on exit
-            self._save_cookies()
+            self._save_session()
         except:
             pass
         try:
@@ -672,7 +791,9 @@ def main():
         while True:
             try:
                 console.print(Rule(style="muted"))
-                user_input = console.input("[user_label]  You  [/user_label][muted] › [/muted]").strip()
+                user_input = console.input(
+                    "[user_label]  You  [/user_label][muted] › [/muted]"
+                ).strip()
 
                 if not user_input:
                     continue
@@ -712,8 +833,10 @@ def main():
                             scraper._wait_for_input()
                         console.print("[success]✔[/success]  Refreshed.")
                     else:
-                        console.print(f"[error]Unknown command:[/error] [cmd]{cmd}[/cmd]  "
-                                      "[muted]— type /help to see commands[/muted]")
+                        console.print(
+                            f"[error]Unknown command:[/error] [cmd]{cmd}[/cmd]  "
+                            "[muted]— type /help to see commands[/muted]"
+                        )
                     continue
 
                 # ── Send & render ──────────────────────────────
