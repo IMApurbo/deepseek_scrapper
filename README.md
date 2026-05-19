@@ -9,7 +9,7 @@ A Playwright-based terminal client and Anthropic API proxy for **chat.deepseek.c
 | File | Purpose |
 |---|---|
 | `deepseek_scraper.py` | Terminal chat client + core scraper class |
-| `server.py` | Anthropic API proxy — exposes `POST /v1/messages` backed by DeepSeek |
+| `deepseek_server.py` | Anthropic API proxy — exposes `POST /v1/messages` backed by DeepSeek |
 
 ---
 
@@ -59,7 +59,7 @@ A Chromium window opens and navigates to `chat.deepseek.com`. If you are not log
 ### Anthropic API proxy
 
 ```bash
-python server.py
+python deepseek_server.py
 ```
 
 Then point any Anthropic-compatible tool at the local server:
@@ -78,11 +78,25 @@ claude        # Claude Code CLI
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8765` | Port |
 | `--headless` | off | Run browser without a visible window |
+| `--search` | off | Enable the Search toggle in the DeepSeek UI |
+| `--deepthink` | off | Enable the DeepThink toggle in the DeepSeek UI |
+| `--expert` | off | Enable the Expert model in the DeepSeek UI |
 | `--no-warmup` | off | Skip pre-launching browser (lazy init on first request) |
 
 ```bash
-python server.py --headless --port 9000
+python deepseek_server.py --headless --port 9000
+python deepseek_server.py --headless --search --deepthink
 ```
+
+> **Toggle defaults:** DeepSeek's web UI enables Search by default. The proxy always turns it **off** on startup unless `--search` is passed. DeepThink and Expert are off by default and are only enabled when their respective flags are given.
+
+| Flags passed | Search | DeepThink | Expert |
+|---|---|---|---|
+| *(none)* | off | off | off |
+| `--search` | **on** | off | off |
+| `--deepthink` | off | **on** | off |
+| `--expert` | off | off | **on** |
+| `--search --deepthink` | **on** | **on** | off |
 
 #### Endpoints
 
@@ -109,3 +123,10 @@ On first run you log in once inside the browser window. After that, cookies and 
 On every subsequent launch the saved session is restored before the page loads, so the login screen is skipped automatically. The session is re-saved after each clean exit.
 
 ---
+
+## License
+
+MIT License — © [License](https://github.com/IMApurbo/deepseek_scrapper/LICENSE)
+
+## Author 
+[IMApurbo](https://github.com/IMApurbo)
