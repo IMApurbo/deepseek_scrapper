@@ -126,7 +126,7 @@ On every subsequent launch the saved session is restored before the page loads, 
 
 ## License
 
-MIT License — © [License](https://github.com/IMApurbo/deepseek_scrapper/LICENSE)
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ## Author 
-[IMApurbo](https://github.com/IMApurbo)
+ [@IMApurbo](https://github.com/IMApurbo)
