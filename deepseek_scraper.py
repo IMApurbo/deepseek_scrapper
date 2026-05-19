@@ -9,9 +9,8 @@ import time
 import json
 import re
 import sys
-import os
 from pathlib import Path
-from datetime import datetime
+from html.parser import HTMLParser
 from playwright.sync_api import sync_playwright
 
 # ── Rich imports ──────────────────────────────────────────────
@@ -28,7 +27,7 @@ from rich.spinner import Spinner
 from rich.align import Align
 from rich.padding import Padding
 
-# ── Optional html2text ────────────────────────────────────────
+# ── Optional html2text (preferred path) ───────────────────────
 try:
     import html2text as _html2text_mod
     _H2T = _html2text_mod.HTML2Text()
@@ -44,10 +43,10 @@ except ImportError:
 # ── Persistent session directory ──────────────────────────────
 SESSION_DIR  = Path.home() / ".deepseek_scraper"
 COOKIES_FILE = SESSION_DIR / "cookies.json"
-STORAGE_FILE = SESSION_DIR / "storage.json"   # localStorage + sessionStorage
+STORAGE_FILE = SESSION_DIR / "storage.json"
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
-# Far-future expiry (year 2099) — forces session cookies to persist across launches
+# Far-future expiry (year 2099) — forces session cookies to persist
 FAR_FUTURE = 4070908800
 
 # ── Theme ─────────────────────────────────────────────────────
@@ -67,6 +66,348 @@ THEME = Theme({
 })
 
 console = Console(theme=THEME, highlight=False)
+
+
+# ─────────────────────────────────────────────────────────────
+# Fallback HTML → Markdown Parser
+# ─────────────────────────────────────────────────────────────
+
+class _MDParser(HTMLParser):
+    """
+    Minimal but correct HTML-to-Markdown converter used as a fallback
+    when html2text is not installed.
+
+    Key fixes vs the original:
+      • Code-fence language hints are captured from <code class="language-*">
+        inside <pre> blocks → produces ```python, ```bash, etc.
+      • <p> inside <li> no longer inserts double-newlines that break bullet layout.
+      • <br> inside <li> emits a space instead of a hard line-break.
+      • Language tag is injected on the opening ``` fence, not when </code> fires.
+    """
+
+    IGNORE_TAGS = frozenset({
+        "svg", "script", "style", "noscript", "button", "input",
+        "select", "form", "head", "meta", "link",
+        "sup", "sub", "cite", "time", "footer", "nav", "aside",
+    })
+    BOLD_TAGS   = frozenset({"strong", "b"})
+    ITALIC_TAGS = frozenset({"em", "i"})
+    CODE_TAGS   = frozenset({"code"})
+    DEL_TAGS    = frozenset({"s", "del", "strike"})
+    UNDER_TAGS  = frozenset({"u"})
+
+    def __init__(self):
+        super().__init__()
+        self.out          = []       # output token list
+        self.stack        = []       # tag stack (str or ("a", href))
+        self.ignore_depth = 0        # depth inside ignored subtrees
+        self.pre_depth    = 0        # depth inside <pre> blocks
+        self.list_stack   = []       # [["ul"|"ol", counter], ...]
+        self.li_depth     = 0        # how many <li> deep we are
+        self.in_link      = False
+        self.link_buf     = []       # text accumulator for <a>
+        self.link_href    = ""
+        self.in_cell      = False
+        self.cell_buf     = []       # text accumulator for <td>/<th>
+        self.td_buf       = []       # cell texts for current <tr>
+        self.header_row   = False
+        self.in_table     = False
+        self._pending_fence = None   # fence token index awaiting language patch
+
+    # ── helpers ───────────────────────────────────────────────
+
+    def _in_li(self) -> bool:
+        return self.li_depth > 0
+
+    def _emit(self, text: str):
+        """Route output to the correct buffer."""
+        if self.in_link:
+            self.link_buf.append(text)
+        elif self.in_cell:
+            self.cell_buf.append(text)
+        else:
+            self.out.append(text)
+
+    # ── tag handlers ──────────────────────────────────────────
+
+    def handle_starttag(self, tag: str, attrs):
+        tag   = tag.lower()
+        adict = dict(attrs)
+
+        # ── ignored subtrees ──────────────────────────────────
+        if self.ignore_depth or tag in self.IGNORE_TAGS:
+            self.ignore_depth += 1
+            self.stack.append(("__ignore__", tag))
+            return
+
+        self.stack.append(tag)
+
+        # ── headings ──────────────────────────────────────────
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self.out.append(f"\n\n{'#' * int(tag[1])} ")
+
+        # ── paragraphs ────────────────────────────────────────
+        elif tag == "p":
+            # Inside <li>: <p> is inline spacing only — no block break.
+            # The double-newline here was the root cause of the blank-line
+            # bullet bug in the original code.
+            if not self._in_li():
+                self.out.append("\n\n")
+
+        # ── lists ─────────────────────────────────────────────
+        elif tag in ("ul", "ol"):
+            self.list_stack.append([tag, 0])
+            self.out.append("\n")
+
+        elif tag == "li":
+            self.li_depth += 1
+            if self.list_stack:
+                kind, count = self.list_stack[-1]
+                if kind == "ol":
+                    self.list_stack[-1][1] += 1
+                    marker = f"{self.list_stack[-1][1]}. "
+                else:
+                    marker = "- "
+                indent = "  " * (len(self.list_stack) - 1)
+                self.out.append(f"\n{indent}{marker}")
+
+        # ── blockquote ────────────────────────────────────────
+        elif tag == "blockquote":
+            self.out.append("\n\n> ")
+
+        # ── pre / code ────────────────────────────────────────
+        elif tag == "pre":
+            self.pre_depth += 1
+            # Emit opening fence; record its index so we can patch in
+            # the language hint when the inner <code class="language-*"> fires.
+            fence = "```"
+            self.out.append(f"\n\n{fence}")
+            self._pending_fence = len(self.out) - 1   # index of the fence token
+
+        elif tag == "code":
+            if self.pre_depth > 0:
+                # ── fenced code block ─────────────────────────
+                # Extract language from class="language-python" etc.
+                cls  = adict.get("class", "")
+                m    = re.search(r"\blanguage-(\w+)\b", cls)
+                lang = m.group(1) if m else ""
+
+                # Patch the pending opening fence with the language hint.
+                # e.g. "```" → "```python"
+                if lang and self._pending_fence is not None:
+                    self.out[self._pending_fence] = (
+                        self.out[self._pending_fence].rstrip("`") + f"```{lang}"
+                    )
+                self._pending_fence = None
+                # A newline after the opening fence keeps the first line of
+                # code on its own line (required by CommonMark).
+                self.out.append("\n")
+            else:
+                # ── inline code ───────────────────────────────
+                self._emit("`")
+
+        # ── inline formatting ─────────────────────────────────
+        elif tag in self.BOLD_TAGS:
+            self._emit("**")
+        elif tag in self.ITALIC_TAGS:
+            self._emit("*")
+        elif tag in self.DEL_TAGS:
+            self._emit("~~")
+        elif tag in self.UNDER_TAGS:
+            self._emit("__")
+
+        # ── links ─────────────────────────────────────────────
+        elif tag == "a":
+            self.stack[-1] = ("a", adict.get("href", ""))
+            self.in_link   = True
+            self.link_href = adict.get("href", "")
+            self.link_buf  = []
+
+        # ── line-level ────────────────────────────────────────
+        elif tag == "br":
+            # Inside <li>: <br> is a soft wrap, not a hard break.
+            if self._in_li():
+                self._emit(" ")
+            else:
+                self._emit("  \n")
+
+        elif tag == "hr":
+            self.out.append("\n\n---\n\n")
+
+        # ── tables ────────────────────────────────────────────
+        elif tag == "table":
+            self.in_table = True
+            self.out.append("\n\n")
+
+        elif tag == "tr":
+            self.td_buf = []
+
+        elif tag == "thead":
+            self.header_row = True
+
+        elif tag in ("th", "td"):
+            self.in_cell  = True
+            self.cell_buf = []
+
+    def handle_endtag(self, tag: str):
+        tag = tag.lower()
+        if not self.stack:
+            return
+
+        # Pop the matching open-tag entry (search from the top).
+        entry = None
+        for i in range(len(self.stack) - 1, -1, -1):
+            item = self.stack[i]
+            item_tag = item[0] if isinstance(item, tuple) else item
+            if item_tag == tag or (item_tag == "__ignore__" and item[1] == tag):
+                entry = self.stack.pop(i)
+                break
+        else:
+            return  # unmatched close tag — ignore
+
+        # ── ignored subtrees ──────────────────────────────────
+        if isinstance(entry, tuple) and entry[0] == "__ignore__":
+            self.ignore_depth = max(0, self.ignore_depth - 1)
+            return
+
+        # ── headings ──────────────────────────────────────────
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self.out.append("\n")
+
+        # ── paragraphs ────────────────────────────────────────
+        elif tag == "p":
+            if not self._in_li():
+                self.out.append("\n")
+
+        # ── lists ─────────────────────────────────────────────
+        elif tag == "li":
+            self.li_depth = max(0, self.li_depth - 1)
+
+        elif tag in ("ul", "ol"):
+            if self.list_stack:
+                self.list_stack.pop()
+            self.out.append("\n")
+
+        # ── blockquote ────────────────────────────────────────
+        elif tag == "blockquote":
+            self.out.append("\n\n")
+
+        # ── pre / code ────────────────────────────────────────
+        elif tag == "pre":
+            self.pre_depth = max(0, self.pre_depth - 1)
+            self._pending_fence = None
+            self.out.append("\n```\n\n")
+
+        elif tag == "code":
+            if self.pre_depth == 0:
+                self._emit("`")
+            # For fenced blocks the closing ``` is emitted by </pre>
+
+        # ── inline formatting ─────────────────────────────────
+        elif tag in self.BOLD_TAGS:
+            self._emit("**")
+        elif tag in self.ITALIC_TAGS:
+            self._emit("*")
+        elif tag in self.DEL_TAGS:
+            self._emit("~~")
+        elif tag in self.UNDER_TAGS:
+            self._emit("__")
+
+        # ── links ─────────────────────────────────────────────
+        elif tag == "a":
+            self.in_link = False
+            lt   = "".join(self.link_buf).strip()
+            href = self.link_href
+            if lt and href:
+                self.out.append(f"[{lt}]({href})")
+            elif lt:
+                self.out.append(lt)
+            elif href:
+                self.out.append(href)
+            self.link_buf  = []
+            self.link_href = ""
+
+        # ── tables ────────────────────────────────────────────
+        elif tag in ("td", "th"):
+            self.in_cell = False
+            self.td_buf.append("".join(self.cell_buf).strip())
+            self.cell_buf = []
+
+        elif tag == "tr":
+            row = "| " + " | ".join(self.td_buf) + " |"
+            self.out.append(row + "\n")
+            if self.header_row:
+                sep = "| " + " | ".join(["---"] * len(self.td_buf)) + " |"
+                self.out.append(sep + "\n")
+                self.header_row = False
+            self.td_buf = []
+
+        elif tag == "table":
+            self.in_table = False
+            self.out.append("\n")
+
+    def handle_data(self, data: str):
+        if self.ignore_depth:
+            return
+        if self.pre_depth:
+            # Inside a <pre> block: preserve whitespace exactly.
+            self.out.append(data)
+        else:
+            # Collapse internal whitespace to a single space.
+            self._emit(re.sub(r"\s+", " ", data))
+
+    def handle_entityref(self, name: str):
+        _ENTITIES = {
+            "amp": "&", "lt": "<", "gt": ">", "quot": '"',
+            "nbsp": " ", "mdash": "—", "ndash": "–", "hellip": "…",
+            "ldquo": "\u201c", "rdquo": "\u201d",
+            "lsquo": "\u2018", "rsquo": "\u2019",
+        }
+        self._emit(_ENTITIES.get(name, f"&{name};"))
+
+    def handle_charref(self, name: str):
+        try:
+            ch = chr(int(name[1:], 16) if name.lower().startswith("x") else int(name))
+            self._emit(ch)
+        except (ValueError, OverflowError):
+            pass
+
+    def get_md(self) -> str:
+        raw = "".join(str(x) for x in self.out)
+        # Collapse 3+ blank lines to 2
+        raw = re.sub(r"\n{3,}", "\n\n", raw)
+        # Remove spurious blank lines between a list marker and its text body
+        # e.g. "- \n\nSome text" → "- Some text"
+        raw = re.sub(r"((?:^|\n)[ \t]*(?:[-*+]|\d+[.)]) *)\n\n+", r"\1", raw)
+        # Trim trailing whitespace per line
+        raw = "\n".join(line.rstrip() for line in raw.split("\n"))
+        return raw.strip()
+
+
+def _html_to_md(html: str) -> str:
+    """
+    Convert an HTML string to Markdown.
+
+    Prefers html2text when available (handles edge cases better).
+    Falls back to the custom _MDParser above, which correctly emits
+    language-annotated fenced code blocks (```python, ```bash, etc.).
+    """
+    if not html or not html.strip():
+        return ""
+
+    if HAS_HTML2TEXT:
+        try:
+            return _H2T.handle(html).strip()
+        except Exception:
+            pass
+
+    try:
+        p = _MDParser()
+        p.feed(html)
+        return p.get_md()
+    except Exception:
+        # Last-resort: strip all tags
+        return re.sub(r"<[^>]+>", "", html).strip()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -116,7 +457,7 @@ def print_help():
     console.print()
 
 
-def spinner_ctx(message: str, style: str = "#60A5FA"):
+def _spinner_ctx(message: str, style: str = "#60A5FA"):
     renderable = Align.left(Spinner("dots2", text=Text(f"  {message}", style=style)))
     return Live(renderable, console=console, refresh_per_second=12, transient=True)
 
@@ -136,7 +477,6 @@ def render_response(md_text: str, reasoning_blocks: list, elapsed: float):
 
 
 def render_thinking(reasoning_blocks: list):
-    """Render each reasoning block as its own numbered panel."""
     total = len(reasoning_blocks)
     for i, block in enumerate(reasoning_blocks, 1):
         label = f"💭 Reasoning{f' [{i}/{total}]' if total > 1 else ''}"
@@ -153,31 +493,35 @@ def render_thinking(reasoning_blocks: list):
 # ─────────────────────────────────────────────────────────────
 
 class DeepSeekScraper:
-    INPUT_SEL    = "textarea._27c9245"
-    MSG_SEL      = "div.ds-message._63c77b1"
+    INPUT_SEL = "textarea._27c9245"
+    MSG_SEL   = "div.ds-message._63c77b1"
 
-    # Stop button class anatomy (observed from DOM):
-    #   idle/done  → class="_52c986b bd74640a ds-icon-button ... ds-icon-button--disabled"
-    #                aria-disabled="true"
-    #   generating → class="_52c986b ds-icon-button ... "   (bd74640a is GONE)
-    #                aria-disabled="false"
-    #
-    # So: ACTIVE = has ._52c986b but NOT .bd74640a (the bd74640a class is the "done" marker)
+    # Generating state:   ._52c986b present  AND  .bd74640a ABSENT  AND  aria-disabled=false
+    # Idle/done state:    ._52c986b present  AND  .bd74640a PRESENT AND  aria-disabled=true
     STOP_BTN_ACTIVE_SEL = "div._52c986b:not(.bd74640a)"
 
-    def __init__(self, headless: bool = False):
-        self.headless   = headless
-        self.browser    = None
-        self.context    = None
-        self.page       = None
-        self.playwright = None
+    def __init__(
+        self,
+        headless:        bool = False,
+        enable_search:   bool = False,
+        enable_deepthink: bool = False,
+        enable_expert:   bool = False,
+    ):
+        self.headless         = headless
+        self.enable_search    = enable_search
+        self.enable_deepthink = enable_deepthink
+        self.enable_expert    = enable_expert
+        self.browser          = None
+        self.context          = None
+        self.page             = None
+        self.playwright       = None
 
     # ─────────────────────────────────────────────────────────
     # Browser Setup
     # ─────────────────────────────────────────────────────────
 
     def start(self):
-        with spinner_ctx("Launching Chromium…"):
+        with _spinner_ctx("Launching Chromium…"):
             self.playwright = sync_playwright().start()
             self.browser = self.playwright.chromium.launch(
                 headless=self.headless,
@@ -185,14 +529,12 @@ class DeepSeekScraper:
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
-                    "--start-maximized",          # open browser maximized
+                    "--start-maximized",
                 ],
             )
-            # ── FIX: viewport=None disables the fixed viewport so the browser
-            #         window controls page size — resizing works naturally. ──
             self.context = self.browser.new_context(
-                viewport=None,                    # no fixed viewport → resize works
-                no_viewport=True,                 # explicit opt-out of viewport emulation
+                viewport=None,
+                no_viewport=True,
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -203,49 +545,42 @@ class DeepSeekScraper:
             self.page = self.context.new_page()
         console.print("[success]✔[/success]  Browser launched")
 
-        # Step 1: inject saved cookies into context BEFORE navigation
         self._load_cookies_silent()
 
-        # Step 2: navigate to site
-        with spinner_ctx("Loading chat.deepseek.com…"):
+        with _spinner_ctx("Loading chat.deepseek.com…"):
             self.page.goto("https://chat.deepseek.com/",
                            wait_until="domcontentloaded", timeout=30000)
         console.print("[success]✔[/success]  Page loaded")
 
-        # Step 3: restore localStorage/sessionStorage (must happen AFTER navigation,
-        #         as storage is origin-scoped and needs a live page context)
         restored = self._restore_storage()
         if restored:
-            with spinner_ctx("Applying saved session…"):
-                # Reload so React/auth state picks up restored tokens
+            with _spinner_ctx("Applying saved session…"):
                 self.page.reload(wait_until="domcontentloaded", timeout=20000)
                 time.sleep(1.2)
 
-        # Step 4: check auth
         self._handle_auth()
         self._handle_captcha()
 
-        with spinner_ctx("Waiting for input box…"):
+        with _spinner_ctx("Waiting for input box…"):
             self._wait_for_input()
         console.print("[success]✔[/success]  Chat input ready\n")
+
+        self._configure_toggles()
 
     # ─────────────────────────────────────────────────────────
     # Session Persistence
     # ─────────────────────────────────────────────────────────
 
     def _load_cookies_silent(self):
-        """Inject saved cookies into Playwright context before first navigation."""
         if not COOKIES_FILE.exists():
             return
         try:
-            raw = json.loads(COOKIES_FILE.read_text())
+            raw     = json.loads(COOKIES_FILE.read_text())
             cleaned = []
             for c in raw:
-                # Playwright requires sameSite to be Strict / Lax / None
                 ss = c.get("sameSite", "Lax")
                 if ss not in ("Strict", "Lax", "None"):
                     c["sameSite"] = "Lax"
-                # Promote session-only cookies (expires -1) to persistent
                 if c.get("expires", -1) in (-1, 0, None):
                     c["expires"] = FAR_FUTURE
                 cleaned.append(c)
@@ -258,28 +593,22 @@ class DeepSeekScraper:
             console.print(f"[warning]⚠  Could not load cookies: {e}[/warning]")
 
     def _restore_storage(self) -> bool:
-        """Inject saved localStorage/sessionStorage into current page.
-        Returns True if any data was restored."""
         if not STORAGE_FILE.exists():
             return False
         try:
-            data = json.loads(STORAGE_FILE.read_text())
-            local   = data.get("localStorage",   {})
-            session = data.get("sessionStorage",  {})
+            data    = json.loads(STORAGE_FILE.read_text())
+            local   = data.get("localStorage",  {})
+            session = data.get("sessionStorage", {})
             if not local and not session:
                 return False
-
             self.page.evaluate("""(state) => {
                 try {
-                    for (const [k, v] of Object.entries(state.localStorage || {})) {
+                    for (const [k, v] of Object.entries(state.localStorage || {}))
                         localStorage.setItem(k, v);
-                    }
-                    for (const [k, v] of Object.entries(state.sessionStorage || {})) {
+                    for (const [k, v] of Object.entries(state.sessionStorage || {}))
                         sessionStorage.setItem(k, v);
-                    }
                 } catch(e) { console.warn('storage restore error', e); }
             }""", {"localStorage": local, "sessionStorage": session})
-
             console.print(
                 f"[success]✔[/success]  Storage restored "
                 f"([muted]{len(local)} local, {len(session)} session keys[/muted])"
@@ -290,18 +619,15 @@ class DeepSeekScraper:
             return False
 
     def _page_is_deepseek(self) -> bool:
-        """True only when current page is on deepseek.com (localStorage accessible)."""
         try:
             url = self.page.url
             return "deepseek.com" in url and not url.startswith("about:")
-        except:
+        except Exception:
             return False
 
     def _save_session(self):
-        """Persist cookies (bumped to far-future) + localStorage + sessionStorage."""
         errors = []
 
-        # Cookies (always safe — read from context, not from page)
         try:
             cookies = self.context.cookies()
             for c in cookies:
@@ -314,8 +640,6 @@ class DeepSeekScraper:
         except Exception as e:
             errors.append(f"cookies: {e}")
 
-        # localStorage + sessionStorage — only accessible when on deepseek.com origin.
-        # Calling this on about:blank or a redirect raises SecurityError.
         if self._page_is_deepseek():
             try:
                 storage = self.page.evaluate("""() => {
@@ -329,7 +653,8 @@ class DeepSeekScraper:
                         )),
                     };
                 }""")
-                total = len(storage.get("localStorage", {})) + len(storage.get("sessionStorage", {}))
+                total = (len(storage.get("localStorage",  {})) +
+                         len(storage.get("sessionStorage", {})))
                 if total > 0:
                     STORAGE_FILE.write_text(json.dumps(storage, indent=2))
             except Exception as e:
@@ -347,7 +672,7 @@ class DeepSeekScraper:
     def _handle_auth(self):
         time.sleep(1.5)
         url = self.page.url
-        if any(x in url for x in ["/sign_in", "/login", "/auth"]):
+        if any(x in url for x in ("/sign_in", "/login", "/auth")):
             console.print(Panel(
                 f"[warning]Login required.[/warning]\n[muted]{url}[/muted]\n\n"
                 "Log in inside the browser window.\n"
@@ -361,18 +686,21 @@ class DeepSeekScraper:
                     "() => !window.location.href.includes('/sign_in')",
                     timeout=60000,
                 )
-            except:
+            except Exception:
                 pass
             time.sleep(1.5)
-            # Save immediately after successful login
             self._save_session()
         else:
-            # Already authenticated — refresh saved session
             self._save_session()
 
     def _handle_captcha(self):
-        for sig in ["iframe[src*='recaptcha']", "iframe[src*='captcha']",
-                    ".g-recaptcha", "text=Verify you are human", "text=Security Check"]:
+        for sig in [
+            "iframe[src*='recaptcha']",
+            "iframe[src*='captcha']",
+            ".g-recaptcha",
+            "text=Verify you are human",
+            "text=Security Check",
+        ]:
             try:
                 if self.page.locator(sig).count() > 0:
                     console.print(Panel(
@@ -384,22 +712,154 @@ class DeepSeekScraper:
                     input()
                     self._save_session()
                     return
-            except:
+            except Exception:
                 pass
 
     def _wait_for_input(self):
         try:
             self.page.wait_for_selector(self.INPUT_SEL, state="visible", timeout=20000)
-        except:
+        except Exception:
             console.print("[error]✘  Input not found — page may need login[/error]")
             console.print(f"[muted]   {self.page.url}[/muted]")
+
+    # ─────────────────────────────────────────────────────────
+    # Toggle Configuration (Search / DeepThink / Expert)
+    # ─────────────────────────────────────────────────────────
+
+    def _configure_toggles(self):
+        """
+        Enable or disable the Search, DeepThink, and Expert toggles
+        according to the flags set at construction time.
+
+        Toggle state is read from aria-pressed (Search / DeepThink) and
+        aria-checked (Expert).  The class ``ds-toggle-button--selected``
+        is also present when a toggle is active, but aria-pressed is the
+        canonical source of truth.
+
+        Search is ON by default in the DeepSeek UI, so we always run this
+        method — even when no flags are set — so we can turn Search off.
+
+        Button identification
+        ────────────────────
+        Search and DeepThink share the same CSS classes:
+          off: ds-atom-button f79352dc ds-toggle-button ds-toggle-button--md
+          on:  … ds-toggle-button--selected …
+
+        We locate them by inner text (case-insensitive) so the logic stays
+        correct even if DeepSeek reorders the toolbar.
+
+        Expert uses [data-model-type="expert"] with aria-checked.
+        """
+        console.print("[info]  Configuring feature toggles…[/info]")
+
+        # ── helpers ───────────────────────────────────────────
+
+        def _find_toggle_by_text(label_text: str):
+            """
+            Return the first ds-toggle-button whose visible text contains
+            label_text (case-insensitive).  Returns None when not found.
+            """
+            try:
+                # aria-pressed is present on both enabled and disabled states
+                candidates = self.page.locator(
+                    "button.ds-toggle-button[aria-pressed], "
+                    "div.ds-toggle-button[aria-pressed]"
+                )
+                count = candidates.count()
+                for i in range(count):
+                    el = candidates.nth(i)
+                    try:
+                        text = (el.inner_text() or "").strip().lower()
+                    except Exception:
+                        text = ""
+                    if label_text.lower() in text:
+                        return el
+                # Fallback: return None — caller will warn
+                return None
+            except Exception:
+                return None
+
+        def _toggle_button(label: str, want_enabled: bool):
+            """
+            Click a Search/DeepThink toggle only when its current state
+            differs from want_enabled.
+            """
+            btn = _find_toggle_by_text(label)
+            if btn is None:
+                console.print(
+                    f"[warning]⚠  {label} toggle not found — skipping[/warning]"
+                )
+                return
+            try:
+                current = (btn.get_attribute("aria-pressed") or "false").lower()
+                is_on   = current == "true"
+                if want_enabled and not is_on:
+                    btn.click()
+                    time.sleep(0.4)
+                    console.print(f"[success]✔[/success]  {label} enabled")
+                elif not want_enabled and is_on:
+                    btn.click()
+                    time.sleep(0.4)
+                    console.print(f"[muted]  {label} disabled[/muted]")
+                else:
+                    state = "on" if is_on else "off"
+                    console.print(
+                        f"[muted]  {label} already {state} — no change[/muted]"
+                    )
+            except Exception as e:
+                console.print(f"[warning]⚠  {label} toggle error: {e}[/warning]")
+
+        def _toggle_expert(want_enabled: bool):
+            """
+            Select or deselect the Expert model option.
+            Uses aria-checked (not aria-pressed) on [data-model-type="expert"].
+            """
+            try:
+                btn = self.page.locator("[data-model-type='expert']").first
+                if btn.count() == 0:
+                    console.print(
+                        "[warning]⚠  Expert model button not found — skipping[/warning]"
+                    )
+                    return
+                current = (btn.get_attribute("aria-checked") or "false").lower()
+                is_on   = current == "true"
+                if want_enabled and not is_on:
+                    btn.click()
+                    time.sleep(0.4)
+                    console.print("[success]✔[/success]  Expert model enabled")
+                elif not want_enabled and is_on:
+                    btn.click()
+                    time.sleep(0.4)
+                    console.print("[muted]  Expert model disabled[/muted]")
+                else:
+                    state = "on" if is_on else "off"
+                    console.print(
+                        f"[muted]  Expert model already {state} — no change[/muted]"
+                    )
+            except Exception as e:
+                console.print(f"[warning]⚠  Expert toggle error: {e}[/warning]")
+
+        # ── Search ────────────────────────────────────────────
+        # Default in the DeepSeek UI is ON — turn it off unless --search was given.
+        _toggle_button("Search", want_enabled=self.enable_search)
+
+        # ── DeepThink ─────────────────────────────────────────
+        # Default is OFF — only enable when --deepthink was given.
+        _toggle_button("DeepThink", want_enabled=self.enable_deepthink)
+
+        # ── Expert model ──────────────────────────────────────
+        # Default is OFF — only enable when --expert was given.
+        if self.enable_expert:
+            _toggle_expert(want_enabled=True)
+
+        console.print()
 
     # ─────────────────────────────────────────────────────────
     # Core: Send Message
     # ─────────────────────────────────────────────────────────
 
     def send_message(self, message: str) -> tuple:
-        """Returns (md_response, reasoning_blocks: list[str], elapsed)."""
+        """Returns (md_response: str, reasoning_blocks: list[str], elapsed: float)."""
         if not self.page:
             return ("[Error] Browser not started.", [], 0.0)
         try:
@@ -423,30 +883,22 @@ class DeepSeekScraper:
     # ─────────────────────────────────────────────────────────
 
     def _stop_btn_active(self) -> bool:
-        """True while DeepSeek is generating.
-
-        Class changes observed live:
-          idle/done  → ._52c986b.bd74640a  + ds-icon-button--disabled  aria-disabled=true
-          generating → ._52c986b           (bd74640a class REMOVED)    aria-disabled=false
-
-        So active generation = ._52c986b exists WITHOUT .bd74640a
-        Once bd74640a reappears the response is fully complete — grab immediately.
-        """
+        """True while DeepSeek is generating a response."""
         try:
             return self.page.locator(self.STOP_BTN_ACTIVE_SEL).count() > 0
-        except:
+        except Exception:
             return False
 
     def _wait_for_response_complete(self, timeout: int = 300):
         deadline = time.time() + timeout
 
-        def _spin(label, style="#60A5FA"):
+        def _spin(label: str, style: str = "#60A5FA"):
             return Align.left(Spinner("dots2", text=Text(f"  {label}", style=style)))
 
         with Live(_spin("Waiting for DeepSeek…"), console=console,
                   refresh_per_second=12, transient=True) as live:
 
-            # Wait up to 10s for generation to start
+            # Wait up to 10 s for generation to start
             start_deadline = time.time() + 10
             while time.time() < start_deadline:
                 if self._stop_btn_active():
@@ -461,14 +913,14 @@ class DeepSeekScraper:
                     live.update(Text(""))
                     return
                 try:
-                    think_count = self.page.locator(
+                    thinking = self.page.locator(
                         "div.e1675d8b.ds-think-content._767406f"
-                    ).count()
-                    if think_count > 0:
-                        live.update(_spin("Reasoning…", "#FCD34D"))
-                    else:
-                        live.update(_spin("Generating response…"))
-                except:
+                    ).count() > 0
+                    live.update(
+                        _spin("Reasoning…", "#FCD34D") if thinking
+                        else _spin("Generating response…")
+                    )
+                except Exception:
                     pass
                 time.sleep(0.25)
 
@@ -480,35 +932,33 @@ class DeepSeekScraper:
 
     def _scrape_last_response(self) -> tuple:
         """
-        Returns (response_md, reasoning_blocks: list[str]).
+        Returns (response_md: str, reasoning_blocks: list[str]).
 
-        DOM layout inside the last ds-message:
-          - 1 ds-markdown block  → plain response, no reasoning
-          - 2+ ds-markdown blocks → blocks[:-1] are reasoning steps, blocks[-1] is response
-
-        Each reasoning block is returned individually so the UI can render them
-        as separate panels (matching what DeepSeek actually shows in the browser).
+        DOM layout inside the last .ds-message:
+          1 ds-markdown block  → pure response, no reasoning
+          2+ ds-markdown blocks → blocks[:-1] are reasoning steps; blocks[-1] is the answer
         """
         try:
             info = self.page.evaluate("""() => {
-                var msgs = document.querySelectorAll("div.ds-message._63c77b1");
+                const msgs = document.querySelectorAll("div.ds-message._63c77b1");
                 if (!msgs.length) return { count: 0, texts: [] };
-                var last = msgs[msgs.length - 1];
-                var blocks = last.querySelectorAll("div.ds-markdown");
-                var texts = [];
-                for (var i = 0; i < blocks.length; i++) {
-                    var c = blocks[i].cloneNode(true);
-                    var junk = c.querySelectorAll("svg,script,style,noscript,button,span.ds-markdown-cite");
-                    for (var j = 0; j < junk.length; j++) junk[j].remove();
-                    texts.push(c.outerHTML);
+                const last   = msgs[msgs.length - 1];
+                const blocks = Array.from(last.querySelectorAll("div.ds-markdown"));
+                const texts  = blocks.map(b => {
+                    const c = b.cloneNode(true);
+                    c.querySelectorAll(
+                        "svg,script,style,noscript,button,span.ds-markdown-cite"
+                    ).forEach(el => el.remove());
+                    return c.outerHTML;
+                });
+                if (!texts.length) {
+                    const c2 = last.cloneNode(true);
+                    c2.querySelectorAll(
+                        "svg,script,style,noscript,button,span.ds-markdown-cite"
+                    ).forEach(el => el.remove());
+                    return { count: 0, texts: [c2.outerHTML] };
                 }
-                if (texts.length === 0) {
-                    var c2 = last.cloneNode(true);
-                    var junk2 = c2.querySelectorAll("svg,script,style,noscript,button,span.ds-markdown-cite");
-                    for (var j = 0; j < junk2.length; j++) junk2[j].remove();
-                    texts.push(c2.outerHTML);
-                }
-                return { count: blocks.length, texts: texts };
+                return { count: blocks.length, texts };
             }""")
 
             texts = info.get("texts", [])
@@ -518,173 +968,14 @@ class DeepSeekScraper:
                 return ("[Error] Empty response", [])
 
             if count <= 1:
-                # Single block → pure response, no reasoning
-                return (self._html_to_md(texts[0]) or "[Error] Empty response", [])
-            else:
-                # All blocks except the last are reasoning steps; last is the answer
-                response_md      = self._html_to_md(texts[-1])
-                reasoning_blocks = [self._html_to_md(h) for h in texts[:-1] if h.strip()]
-                return (response_md or "[Error] Empty response", reasoning_blocks)
+                return (_html_to_md(texts[0]) or "[Error] Empty response", [])
+
+            response_md      = _html_to_md(texts[-1])
+            reasoning_blocks = [_html_to_md(h) for h in texts[:-1] if h.strip()]
+            return (response_md or "[Error] Empty response", reasoning_blocks)
 
         except Exception as e:
             return (f"[Error] {e}", [])
-
-    def _html_to_md(self, html: str) -> str:
-        if not html or not html.strip():
-            return ""
-        if HAS_HTML2TEXT:
-            try:
-                return _H2T.handle(html).strip()
-            except:
-                pass
-
-        # Fallback minimal HTML-to-Markdown parser
-        try:
-            from html.parser import HTMLParser
-
-            class _MDParser(HTMLParser):
-                IGNORE = {'svg','script','style','noscript','button','input',
-                          'select','form','head','meta','link',
-                          'sup','sub','cite','time','footer','nav','aside'}
-                BOLD={'strong','b'}; ITALIC={'em','i'}; CODE={'code'}
-                DEL={'s','del','strike'}; UNDER={'u'}
-
-                def __init__(self):
-                    super().__init__()
-                    self.out=[];self.stack=[];self.ignore_depth=0;self.pre_depth=0
-                    self.list_stack=[];self.li_depth=0   # li_depth: are we inside an <li>?
-                    self.in_table=False;self.td_buf=[]
-                    self.header_row=False;self.link_buf=[];self.in_link=False
-                    self.cell_buf=[];self.in_cell=False
-
-                def _in_li(self):
-                    """True when currently inside a <li> element."""
-                    return self.li_depth > 0
-
-                def handle_starttag(self, tag, attrs):
-                    tag=tag.lower(); adict=dict(attrs)
-                    if self.ignore_depth or tag in self.IGNORE:
-                        self.ignore_depth+=1; self.stack.append(tag); return
-                    self.stack.append(tag)
-                    if tag in ('h1','h2','h3','h4','h5','h6'):
-                        self.out.append('\n\n'+'#'*int(tag[1])+' ')
-                    elif tag=='p':
-                        # Inside a list item: <p> is just inline spacing, not a block break.
-                        # Emitting \n\n here causes the bullet marker to appear on its own
-                        # line with a blank gap before the text — the visual bug we're fixing.
-                        if not self._in_li():
-                            self.out.append('\n\n')
-                        # else: do nothing — content flows inline after the bullet
-                    elif tag in ('ul','ol'): self.list_stack.append([tag,0]); self.out.append('\n')
-                    elif tag=='li':
-                        self.li_depth+=1
-                        if self.list_stack:
-                            k,_=self.list_stack[-1]
-                            if k=='ol': self.list_stack[-1][1]+=1; p=f"{self.list_stack[-1][1]}. "
-                            else: p='- '
-                            self.out.append(f'\n{"  "*(len(self.list_stack)-1)}{p}')
-                    elif tag=='blockquote': self.out.append('\n\n> ')
-                    elif tag=='pre': self.pre_depth+=1; self.out.append('\n\n```')
-                    elif tag=='code':
-                        if self.pre_depth==0: self.out.append('`')
-                    elif tag in self.BOLD: self.out.append('**')
-                    elif tag in self.ITALIC: self.out.append('*')
-                    elif tag in self.DEL: self.out.append('~~')
-                    elif tag in self.UNDER: self.out.append('__')
-                    elif tag=='a':
-                        self.stack[-1]=('a',adict.get('href','')); self.in_link=True; self.link_buf=[]
-                    elif tag=='br':
-                        # Inside a list item a <br> should just be a space, not a line break
-                        self.out.append(' ' if self._in_li() else '  \n')
-                    elif tag=='hr': self.out.append('\n\n---\n\n')
-                    elif tag=='table': self.in_table=True; self.out.append('\n\n')
-                    elif tag=='tr': self.td_buf=[]
-                    elif tag in ('th','thead'):
-                        if tag=='thead': self.header_row=True
-                        else: self.in_cell=True; self.cell_buf=[]
-                    elif tag=='td': self.in_cell=True; self.cell_buf=[]
-
-                def handle_endtag(self, tag):
-                    tag=tag.lower()
-                    if not self.stack: return
-                    for i in range(len(self.stack)-1,-1,-1):
-                        if self.stack[i]==tag or (isinstance(self.stack[i],tuple) and self.stack[i][0]==tag):
-                            entry=self.stack.pop(i); break
-                    else: return
-                    if self.ignore_depth: self.ignore_depth-=1; return
-                    if tag in ('h1','h2','h3','h4','h5','h6'): self.out.append('\n')
-                    elif tag=='p':
-                        # Mirror the open-tag logic: suppress block break inside <li>
-                        if not self._in_li():
-                            self.out.append('\n')
-                        # else: nothing — no trailing newline that would split the bullet
-                    elif tag=='li':
-                        self.li_depth=max(0, self.li_depth-1)
-                    elif tag in ('ul','ol'):
-                        if self.list_stack: self.list_stack.pop()
-                        self.out.append('\n')
-                    elif tag=='blockquote': self.out.append('\n\n')
-                    elif tag=='pre': self.pre_depth-=1; self.out.append('\n```\n\n')
-                    elif tag=='code':
-                        if self.pre_depth==0: self.out.append('`')
-                    elif tag in self.BOLD: self.out.append('**')
-                    elif tag in self.ITALIC: self.out.append('*')
-                    elif tag in self.DEL: self.out.append('~~')
-                    elif tag in self.UNDER: self.out.append('__')
-                    elif tag=='a':
-                        href=entry[1] if isinstance(entry,tuple) else ''
-                        self.in_link=False
-                        lt=''.join(self.link_buf).strip()
-                        if lt and href: self.out.append(f'[{lt}]({href})')
-                        elif lt: self.out.append(lt)
-                        elif href: self.out.append(href)
-                        self.link_buf=[]
-                    elif tag in ('td','th'):
-                        self.in_cell=False
-                        self.td_buf.append(''.join(self.cell_buf).strip())
-                        self.cell_buf=[]
-                    elif tag=='tr':
-                        self.out.append(f'| {" | ".join(self.td_buf)} |\n')
-                        if self.header_row:
-                            self.out.append(f'| {" | ".join(["---"]*len(self.td_buf))} |\n')
-                            self.header_row=False
-                        self.td_buf=[]
-                    elif tag=='table': self.in_table=False; self.out.append('\n')
-
-                def handle_data(self, data):
-                    if self.ignore_depth: return
-                    if self.pre_depth: self.out.append(data)
-                    elif self.in_link: self.link_buf.append(re.sub(r'\s+',' ',data))
-                    elif self.in_cell: self.cell_buf.append(re.sub(r'\s+',' ',data))
-                    else: self.out.append(re.sub(r'\s+',' ',data))
-
-                def handle_entityref(self, name):
-                    e={'amp':'&','lt':'<','gt':'>','quot':'"','nbsp':' ',
-                       'mdash':'—','ndash':'–','hellip':'…',
-                       'ldquo':'\u201c','rdquo':'\u201d','lsquo':'\u2018','rsquo':'\u2019'}
-                    self.out.append(e.get(name, f'&{name};'))
-
-                def handle_charref(self, name):
-                    try:
-                        self.out.append(
-                            chr(int(name[1:],16) if name.startswith('x') else int(name))
-                        )
-                    except: pass
-
-                def get_md(self):
-                    raw = ''.join(str(x) for x in self.out)
-                    # Collapse 3+ newlines to 2
-                    raw = re.sub(r'\n{3,}', '\n\n', raw)
-                    # Remove blank lines between a list marker line and its continuation
-                    # e.g.  "- \n\nSome text" → "- Some text"
-                    raw = re.sub(r'((?:^|\n)[ \t]*[-\d]+[.)>]? *)\n\n+', r'\1', raw)
-                    # Trim trailing whitespace per line
-                    raw = '\n'.join(line.rstrip() for line in raw.split('\n'))
-                    return raw.strip()
-
-            p = _MDParser(); p.feed(html); return p.get_md()
-        except:
-            return re.sub(r'<[^>]+>', '', html).strip()
 
     # ─────────────────────────────────────────────────────────
     # New Chat
@@ -707,10 +998,10 @@ class DeepSeekScraper:
                     self._wait_for_input()
                     console.print("[success]✔[/success]  New conversation started.")
                     return
-            except:
+            except Exception:
                 continue
 
-        with spinner_ctx("Starting new chat…"):
+        with _spinner_ctx("Starting new chat…"):
             self.page.goto("https://chat.deepseek.com/",
                            wait_until="domcontentloaded", timeout=15000)
             self._wait_for_input()
@@ -724,20 +1015,27 @@ class DeepSeekScraper:
         try:
             return self.page.evaluate("""() => {
                 const history = [];
-                const msgs = document.querySelectorAll('div.ds-message._63c77b1');
+                const msgs = document.querySelectorAll("div.ds-message._63c77b1");
                 msgs.forEach(msg => {
-                    const mdBlocks = Array.from(msg.querySelectorAll('div.ds-markdown'));
-                    const el = mdBlocks.length ? mdBlocks[mdBlocks.length - 1] : msg;
-                    const clone = el.cloneNode(true);
-                    clone.querySelectorAll('svg,script,style,noscript,button').forEach(e => e.remove());
-                    history.push({ role: 'assistant', content: clone.innerHTML.trim() });
+                    const mdBlocks = Array.from(msg.querySelectorAll("div.ds-markdown"));
+                    const el       = mdBlocks.length
+                        ? mdBlocks[mdBlocks.length - 1] : msg;
+                    const clone    = el.cloneNode(true);
+                    clone.querySelectorAll(
+                        "svg,script,style,noscript,button"
+                    ).forEach(e => e.remove());
+                    history.push({ role: "assistant", content: clone.innerHTML.trim() });
                 });
-                for (const sel of ['[class*="user-message"]','[class*="human-message"]',
-                                    '[data-role="user"]']) {
+                for (const sel of [
+                    "[class*='user-message']",
+                    "[class*='human-message']",
+                    "[data-role='user']",
+                ]) {
                     const els = document.querySelectorAll(sel);
                     if (els.length) {
                         els.forEach(e => history.push({
-                            role: 'user', content: e.innerText?.trim() || ''
+                            role: "user",
+                            content: e.innerText?.trim() || "",
                         }));
                         break;
                     }
@@ -755,28 +1053,30 @@ class DeepSeekScraper:
     def debug_dom(self):
         try:
             info = self.page.evaluate("""() => {
-                const stopBtn = document.querySelector('button._52c986b.bd74640a');
-                const msgs = document.querySelectorAll('div.ds-message._63c77b1');
-                const last = msgs.length ? msgs[msgs.length - 1] : null;
-                const lsKeys = Object.keys(localStorage);
-                const authKeys = lsKeys.filter(k =>
-                    /token|auth|user|session/i.test(k)
-                );
+                const stopBtn = document.querySelector("button._52c986b.bd74640a");
+                const msgs    = document.querySelectorAll("div.ds-message._63c77b1");
+                const last    = msgs.length ? msgs[msgs.length - 1] : null;
+                const lsKeys  = Object.keys(localStorage);
                 return {
-                    url: window.location.href,
-                    inputExists: !!document.querySelector('textarea._27c9245'),
-                    stopBtnExists: !!stopBtn,
-                    stopBtnAriaDisabled: stopBtn ? stopBtn.getAttribute('aria-disabled') : null,
-                    dsMessageCount: msgs.length,
-                    lastMsgMdBlocks: last ? last.querySelectorAll('div.ds-markdown').length : 0,
+                    url:                window.location.href,
+                    inputExists:        !!document.querySelector("textarea._27c9245"),
+                    stopBtnExists:      !!stopBtn,
+                    stopBtnAriaDisabled: stopBtn
+                        ? stopBtn.getAttribute("aria-disabled") : null,
+                    dsMessageCount:     msgs.length,
+                    lastMsgMdBlocks:    last
+                        ? last.querySelectorAll("div.ds-markdown").length : 0,
                     lastMsgThinkBlocks: last
-                        ? last.querySelectorAll('div.e1675d8b.ds-think-content._767406f').length
-                        : 0,
-                    localStorageTotal: lsKeys.length,
-                    authRelatedKeys: authKeys,
-                    lastMsgPreview: last ? (last.innerText?.substring(0, 200) || '') : 'none',
-                    viewportWidth: window.innerWidth,
-                    viewportHeight: window.innerHeight,
+                        ? last.querySelectorAll(
+                            "div.e1675d8b.ds-think-content._767406f"
+                          ).length : 0,
+                    localStorageTotal:  lsKeys.length,
+                    authRelatedKeys:    lsKeys.filter(k =>
+                        /token|auth|user|session/i.test(k)),
+                    lastMsgPreview:     last
+                        ? (last.innerText?.substring(0, 200) || "") : "none",
+                    viewportWidth:      window.innerWidth,
+                    viewportHeight:     window.innerHeight,
                 };
             }""")
 
@@ -788,22 +1088,26 @@ class DeepSeekScraper:
             t.add_column("Key",   style="bold #0EA5E9", no_wrap=True)
             t.add_column("Value", style="#60A5FA")
 
-            def tick(v): return "[success]✔  yes[/success]" if v else "[error]✘  no[/error]"
+            def tick(v):
+                return "[success]✔  yes[/success]" if v else "[error]✘  no[/error]"
+
             t.add_row("URL",                   f"[muted]{info.get('url')}[/muted]")
-            t.add_row("Textarea input",        tick(info.get('inputExists')))
-            t.add_row("Stop button exists",    tick(info.get('stopBtnExists')))
-            t.add_row("Stop aria-disabled",    str(info.get('stopBtnAriaDisabled')))
-            t.add_row(".ds-message count",     str(info.get('dsMessageCount')))
-            t.add_row("Last msg ds-markdown",  str(info.get('lastMsgMdBlocks')) + " blocks")
-            t.add_row("Last msg think blocks", str(info.get('lastMsgThinkBlocks')))
-            t.add_row("localStorage total",    str(info.get('localStorageTotal')))
-            t.add_row("Auth-related keys",     str(info.get('authRelatedKeys', [])))
+            t.add_row("Textarea input",        tick(info.get("inputExists")))
+            t.add_row("Stop button exists",    tick(info.get("stopBtnExists")))
+            t.add_row("Stop aria-disabled",    str(info.get("stopBtnAriaDisabled")))
+            t.add_row(".ds-message count",     str(info.get("dsMessageCount")))
+            t.add_row("Last msg ds-markdown",  str(info.get("lastMsgMdBlocks")) + " blocks")
+            t.add_row("Last msg think blocks", str(info.get("lastMsgThinkBlocks")))
+            t.add_row("localStorage total",    str(info.get("localStorageTotal")))
+            t.add_row("Auth-related keys",     str(info.get("authRelatedKeys", [])))
             t.add_row("Viewport size",
                       f"{info.get('viewportWidth')}×{info.get('viewportHeight')} px")
             t.add_row("Last 200 chars",
-                      f"[muted]{str(info.get('lastMsgPreview',''))[:200]}…[/muted]")
+                      f"[muted]{str(info.get('lastMsgPreview', ''))[:200]}…[/muted]")
 
-            console.print(); console.print(t); console.print()
+            console.print()
+            console.print(t)
+            console.print()
         except Exception as e:
             console.print(f"[error]Debug error: {e}[/error]")
 
@@ -814,12 +1118,14 @@ class DeepSeekScraper:
     def close(self):
         try:
             self._save_session()
-        except:
+        except Exception:
             pass
         try:
-            if self.browser:    self.browser.close()
-            if self.playwright: self.playwright.stop()
-        except:
+            if self.browser:
+                self.browser.close()
+            if self.playwright:
+                self.playwright.stop()
+        except Exception:
             pass
 
 
@@ -860,7 +1166,7 @@ def main():
                             console.print("[muted]  No messages found.[/muted]\n")
                         for msg in history:
                             if msg["role"] == "assistant":
-                                md = scraper._html_to_md(msg["content"])
+                                md = _html_to_md(msg["content"])
                                 console.print(Panel(
                                     Padding(Markdown(md, code_theme="monokai"), (1, 2)),
                                     title="[ai_label]🐋 DeepSeek[/ai_label]",
@@ -876,9 +1182,11 @@ def main():
                     elif cmd == "/debug":
                         scraper.debug_dom()
                     elif cmd == "/refresh":
-                        with spinner_ctx("Refreshing…"):
-                            scraper.page.goto("https://chat.deepseek.com/",
-                                              wait_until="domcontentloaded", timeout=15000)
+                        with _spinner_ctx("Refreshing…"):
+                            scraper.page.goto(
+                                "https://chat.deepseek.com/",
+                                wait_until="domcontentloaded", timeout=15000,
+                            )
                             scraper._wait_for_input()
                         console.print("[success]✔[/success]  Refreshed.")
                     else:
