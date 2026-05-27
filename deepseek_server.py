@@ -137,6 +137,56 @@ def _clean_response(text: str, mode: str = "text") -> str:
         m = re.search(r'[{\[]', text)
         if m:
             text = text[m.start():]
+
+        # Fast path: already valid JSON
+        try:
+            json.loads(text)
+            return text.strip()
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # ── Agent-definition repair ───────────────────────────
+        # Claude Code agent creation returns {"identifier":…,"whenToUse":…,"systemPrompt":…}
+        # DeepSeek often puts unescaped " inside string values (e.g. user: "hello")
+        # which breaks json.loads.  Extract each value by known key boundaries,
+        # then re-serialize cleanly with json.dumps so all quotes are properly escaped.
+        _AGENT_KEYS = ['identifier', 'whenToUse', 'systemPrompt']
+        if all(f'"{k}"' in text for k in _AGENT_KEYS):
+            result = {}
+            for i, key in enumerate(_AGENT_KEYS):
+                key_pat = re.compile(r'"' + key + r'"\s*:\s*"')
+                km = key_pat.search(text)
+                if not km:
+                    break
+                val_start = km.end()
+                if i + 1 < len(_AGENT_KEYS):
+                    next_key = _AGENT_KEYS[i + 1]
+                    end_pat = re.compile(r'",\s*\n?\s*"' + next_key + r'"')
+                    em = end_pat.search(text, val_start)
+                    raw_val = text[val_start: em.start()] if em else text[val_start:]
+                else:
+                    em = re.search(r'"\s*\n?\s*\}', text[val_start:])
+                    raw_val = text[val_start: val_start + em.start()] if em else text[val_start:]
+                # raw_val is the JSON-encoded string content; decode it
+                try:
+                    decoded = json.loads('"' + raw_val + '"')
+                except (json.JSONDecodeError, ValueError):
+                    decoded = raw_val  # keep as-is if decode fails
+                result[key] = decoded
+            if len(result) == len(_AGENT_KEYS):
+                return json.dumps(result)
+
+        # ── Generic fallback: trim trailing garbage ───────────
+        for end_char in ('}', ']'):
+            idx = text.rfind(end_char)
+            while idx > 0:
+                candidate = text[:idx + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate.strip()
+                except (json.JSONDecodeError, ValueError):
+                    idx = text.rfind(end_char, 0, idx)
+
         return text.strip()
 
     # ── 6. Code mode: extract + normalise indentation ─────────
@@ -710,6 +760,20 @@ def _detect_clean_mode(prompt: str, has_tools: bool = False) -> str:
         '"alternative_command"',
         '"intent"',
         '"steps"',
+        # Claude Code agent creation — expects {"identifier":...,"whenToUse":...,"systemPrompt":...}
+        '"identifier"',
+        '"whentouse"',
+        '"systemprompt"',
+        'create a new agent',
+        'generate an agent definition',
+        'agent definition json',
+        # Other structured-output patterns Claude Code uses
+        '"bash_command"',
+        '"description"',
+        'output only json',
+        'respond only with json',
+        'only output json',
+        'only respond with json',
     ]
     if any(s in lower for s in json_signals):
         return "json"
