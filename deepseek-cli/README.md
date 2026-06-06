@@ -15,6 +15,7 @@ Open **chat.deepseek.com** in your browser, log in, then open DevTools.
 ### Firefox
 `F12` → **Storage** tab → **Local Storage** → `https://chat.deepseek.com`
 → find the key **`userToken`** → copy the `value` field (the string inside the outer quotes, not the whole JSON)
+<img width="1219" height="651" alt="image" src="https://github.com/user-attachments/assets/740471b6-cecd-41d1-a0bc-ecd8ea946fe1" />
 
 ![Firefox DevTools Storage tab showing userToken]
 
@@ -25,7 +26,7 @@ Open **chat.deepseek.com** in your browser, log in, then open DevTools.
 > The token looks like: `twZij1gbCCmHabkTKDSrUtxRmOOmq1g2KoHfz8Rc38PnHG5kQtEd94kBj83/dyHk`
 >
 <img width="1828" height="986" alt="image" src="https://github.com/user-attachments/assets/103ce2c8-45a3-431e-a8de-46488d03a1ba" />
-<img width="1219" height="651" alt="image" src="https://github.com/user-attachments/assets/740471b6-cecd-41d1-a0bc-ecd8ea946fe1" />
+
 
 
 ---
