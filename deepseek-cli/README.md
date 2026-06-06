@@ -6,13 +6,6 @@
 pip install requests wasmtime numpy flask
 ```
 
-Download the WASM solver into the same folder as the server:
-
-```bash
-curl -L 'https://github.com/Fundiman/dskpp/raw/refs/heads/main/wasm/sha3_wasm_bg.7b9ca65ddd.wasm' \
-     -o sha3_wasm_bg.wasm
-```
-
 ---
 
 ## Step 1 — Get your DeepSeek token
