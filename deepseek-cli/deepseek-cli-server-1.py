@@ -790,9 +790,9 @@ def call_deepseek(session: dict, prompt: str) -> tuple[str, int | None]:
             if chunk:
                 full_text += chunk
 
-    # Always advance the chain so each turn is a child of the previous reply,
-    # not a sibling of the very first message (which loses multi-turn context).
-    if new_root_id is not None:
+    # Pin root after first reply only — all subsequent turns are siblings of
+    # message 1, keeping the DeepSeek conversation memory flat and bounded.
+    if new_root_id is not None and session["root_message_id"] is None:
         session["root_message_id"] = new_root_id
 
     print(f"[deepseek raw]\n{repr(full_text[:500])}\n", flush=True)
