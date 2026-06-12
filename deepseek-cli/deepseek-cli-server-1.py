@@ -25,6 +25,7 @@ Then:
 """
 
 import base64
+import ctypes
 import json
 import os
 import re
@@ -80,8 +81,10 @@ class DeepSeekHash:
         length = len(encoded)
         ptr = self.instance.exports(self.store)["__wbindgen_export_0"](self.store, length, 1)
         mem = self.memory.data_ptr(self.store)
-        for i, byte in enumerate(encoded):
-            mem[ptr + i] = byte
+        # Bulk copy via memmove — avoids slow Python byte-by-byte loop.
+        # mem is ctypes._Pointer[c_ubyte]; get base address as integer then add ptr offset.
+        base = ctypes.cast(mem, ctypes.c_void_p).value
+        ctypes.memmove(base + ptr, encoded, length)
         return ptr, length
 
     def solve(self, challenge: str, salt: str, difficulty: int, expire_at: int) -> int:
@@ -787,8 +790,9 @@ def call_deepseek(session: dict, prompt: str) -> tuple[str, int | None]:
             if chunk:
                 full_text += chunk
 
-    # Pin root after first reply
-    if new_root_id is not None and session["root_message_id"] is None:
+    # Always advance the chain so each turn is a child of the previous reply,
+    # not a sibling of the very first message (which loses multi-turn context).
+    if new_root_id is not None:
         session["root_message_id"] = new_root_id
 
     print(f"[deepseek raw]\n{repr(full_text[:500])}\n", flush=True)
