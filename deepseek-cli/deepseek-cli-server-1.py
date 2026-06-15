@@ -24,6 +24,7 @@ Then:
     claude
 """
 
+import argparse
 import base64
 import ctypes
 import json
@@ -38,6 +39,54 @@ import numpy as np
 import requests
 import wasmtime
 from flask import Flask, Response, request, jsonify
+
+# ── CLI flags ─────────────────────────────────────────────────────────────────
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="DeepSeek → Anthropic API Proxy",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Model / feature flags (all optional; defaults shown):
+  --model fast      Use model_type="default"  (fast model)   [DEFAULT]
+  --model expert    Use model_type=null        (expert model)
+  --search          Enable web search (search_enabled=true)   [DEFAULT]
+  --no-search       Disable web search
+  --think           Enable thinking mode (thinking_enabled=true)
+                    (thinking is OFF by default)
+        """,
+    )
+    parser.add_argument(
+        "--model",
+        choices=["fast", "expert"],
+        default="fast",
+        help='Model tier: "fast" → model_type="default", "expert" → model_type=null (default: fast)',
+    )
+    parser.add_argument(
+        "--search",
+        dest="search",
+        action="store_true",
+        default=True,
+        help="Enable web search (default: on)",
+    )
+    parser.add_argument(
+        "--no-search",
+        dest="search",
+        action="store_false",
+        help="Disable web search",
+    )
+    parser.add_argument(
+        "--think",
+        dest="think",
+        action="store_true",
+        default=False,
+        help="Enable thinking mode (default: off)",
+    )
+    # Allow Flask's reloader to pass extra args without crashing
+    args, _ = parser.parse_known_args()
+    return args
+
+_CLI_ARGS = _parse_args()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -583,14 +632,19 @@ def call_deepseek(session: dict, prompt: str, parent_message_id: int | None) -> 
         "Content-Type":      "application/json",
         "Accept":            "text/event-stream",
     }
+    # Resolve model_type from CLI flag.
+    # "fast"   → model_type = "default"
+    # "expert" → model_type = null (None)
+    model_type = "default" if _CLI_ARGS.model == "fast" else None
+
     body = {
         "chat_session_id":   ds_session,
         "parent_message_id": parent_message_id,
-        "model_type":        "default" if parent_message_id is None else None,
+        "model_type":        model_type,
         "prompt":            prompt,
         "ref_file_ids":      [],
-        "thinking_enabled":  False,
-        "search_enabled":    False,
+        "thinking_enabled":  _CLI_ARGS.think,
+        "search_enabled":    _CLI_ARGS.search,
         "action":            None,
         "preempt":           False,
     }
@@ -1019,7 +1073,14 @@ if __name__ == "__main__":
     hasher = DeepSeekHash(WASM_PATH)
     print("OK")
 
+    model_label  = "fast (model_type=default)" if _CLI_ARGS.model == "fast" else "expert (model_type=null)"
+    search_label = "enabled" if _CLI_ARGS.search else "disabled"
+    think_label  = "enabled" if _CLI_ARGS.think  else "disabled"
+
     print(f"\nDeepSeek proxy listening on http://0.0.0.0:{PORT}")
+    print(f"  model   : {model_label}")
+    print(f"  search  : {search_label}")
+    print(f"  thinking: {think_label}")
     print(f"\nIn your shell:")
     print(f'  export ANTHROPIC_BASE_URL="http://localhost:{PORT}"')
     print(f'  export ANTHROPIC_API_KEY="local-proxy-key"')
