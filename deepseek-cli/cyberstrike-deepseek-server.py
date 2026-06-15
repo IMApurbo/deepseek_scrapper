@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-DeepSeek → Anthropic API Proxy for CyberStrikeAI
-Exposes /messages that CyberStrikeAI can talk to, forwarding to DeepSeek.
+DeepSeek → Anthropic API Proxy
+Exposes /messages that Claude Code can talk to, forwarding to DeepSeek.
 
 - Translates Anthropic tool definitions → XML schema in the prompt
 - Parses DeepSeek plain-text responses for <tool_use> blocks
@@ -16,12 +16,12 @@ Setup:
     Place sha3_wasm_bg.wasm next to this file.
 
     export DEEPSEEK_TOKEN="your-bearer-token"
-    python cyberstrike_server.py
+    python deepseek_server.py
 
 Then:
     export ANTHROPIC_BASE_URL="http://localhost:8765"
     export ANTHROPIC_API_KEY="local-proxy-key"
-    cyberstrike
+    claude
 """
 
 import base64
@@ -169,18 +169,28 @@ class SessionStore:
         self._lock = threading.Lock()
         self._sessions: dict[str, dict] = {}
 
+    def _new_session_dict(self) -> dict:
+        cookies = parse_cookies(COOKIE_STR) if COOKIE_STR else {}
+        http = make_http_session(TOKEN, cookies)
+        ds_id = create_chat_session(http)
+        print(f"[session] new ds_id={ds_id}")
+        return {
+            "ds_session_id":   ds_id,
+            "http":            http,
+            "anchor_message_id": None,  # parent_message_id we keep resending against (None = turn 1)
+            "last_good_message_id": None,  # most recent successful response's message_id (advance target)
+        }
+
     def get_or_create(self, key: str) -> dict:
         with self._lock:
             if key not in self._sessions:
-                cookies = parse_cookies(COOKIE_STR) if COOKIE_STR else {}
-                http = make_http_session(TOKEN, cookies)
-                ds_id = create_chat_session(http)
-                self._sessions[key] = {
-                    "ds_session_id":  ds_id,
-                    "root_message_id": None,
-                    "http":           http,
-                }
-                print(f"[session] new ds_id={ds_id}")
+                self._sessions[key] = self._new_session_dict()
+            return self._sessions[key]
+
+    def reset(self, key: str) -> dict:
+        """Start a brand new chat session/conversation from scratch."""
+        with self._lock:
+            self._sessions[key] = self._new_session_dict()
             return self._sessions[key]
 
 # ── Tool schema → prompt helpers ──────────────────────────────────────────────
@@ -212,16 +222,7 @@ def tools_to_xml(tools: list) -> str:
     return "\n".join(lines)
 
 
-TOOL_CALL_SYSTEM = """You are CyberStrikeAI, an AI-native security testing assistant with access to 100+ integrated security tools. You operate within an intelligent orchestration engine supporting role-based testing, a skills system, lifecycle management, and a built-in C2 framework for authorized engagements.
-
-Your capabilities include:
-- End-to-end security testing automation: recon, scanning, exploitation, post-exploitation
-- Vulnerability discovery and attack-chain analysis
-- C2 operations: listeners, encrypted implants, sessions, tasks, real-time events
-- Knowledge retrieval, result visualization, and audit-trail generation
-- MCP protocol integration and multi-agent orchestration
-
-You assist authorized security teams only. Always operate within the scope of the engagement.
+TOOL_CALL_SYSTEM = """You are Claude, an AI assistant that can use tools.
 
 CRITICAL RULE: When you need to use a tool, you MUST output the tool call immediately using this EXACT format with no variation:
 
@@ -232,11 +233,11 @@ CRITICAL RULE: When you need to use a tool, you MUST output the tool call immedi
 Do NOT say "Let me do that" or "I will run" before calling a tool — just emit the <tool_use> block directly.
 Do NOT make up results — wait for the tool result to be returned.
 Do NOT add markdown backticks around the tool_use block.
-After receiving a tool result, respond naturally with findings, risk context, and recommended next steps.
+After receiving a tool result, respond naturally with the answer.
 
-Example — if asked to run an nmap scan, output EXACTLY:
+Example — if asked to list files, output EXACTLY:
 <tool_use>
-{"name": "Bash", "id": "call_abc123", "input": {"command": "nmap -sV -T4 target"}}
+{"name": "Bash", "id": "call_abc123", "input": {"command": "ls -la"}}
 </tool_use>
 
 Nothing else. No preamble. Just the block.
@@ -309,9 +310,9 @@ def build_prompt(system: str, messages: list, tools: list) -> str:
 
 # ── Response parser: plain text → Anthropic content blocks ───────────────────
 
-# Known DeepSeek native tag names -> CyberStrikeAI Anthropic tool names.
+# Known DeepSeek native tag names -> Claude Code Anthropic tool names.
 # DeepSeek may emit its own XML tags (e.g. <Bash>, <Editor>) which we map
-# to the exact tool names CyberStrikeAI expects.
+# to the exact tool names Claude Code expects.
 DEEPSEEK_TAG_TO_TOOL = {
     # Shell / file ops
     "bash":                        "Bash",
@@ -347,7 +348,7 @@ DEEPSEEK_TAG_TO_TOOL = {
     # Notebook
     "notebookedit":                "NotebookEdit",
     "notebookread":                "NotebookRead",
-    # Misc tools
+    # Misc Claude Code tools
     "skill":                       "Skill",
     "workflow":                    "Workflow",
     "enterplanmode":               "EnterPlanMode",
@@ -356,25 +357,9 @@ DEEPSEEK_TAG_TO_TOOL = {
     "exitworktree":                "ExitWorktree",
     "askuserquestion":             "AskUserQuestion",
     "computer":                    "computer",
-    # CyberStrikeAI security tools
-    "scan":                        "Scan",
-    "exploit":                     "Exploit",
-    "recon":                       "Recon",
-    "enumerate":                   "Enumerate",
-    "bruteforce":                  "BruteForce",
-    "fuzz":                        "Fuzz",
-    "c2":                          "C2",
-    "implant":                     "Implant",
-    "listener":                    "Listener",
-    "session":                     "Session",
-    "payload":                     "Payload",
-    "pivot":                       "Pivot",
-    "exfil":                       "Exfil",
-    "report":                      "Report",
-    "skill":                       "Skill",
 }
 
-# All known CyberStrikeAI tool names (exact casing) used to recognise native
+# All known Claude Code tool names (exact casing) used to recognise native
 # XML tool calls where DeepSeek already uses the correct name.
 CLAUDE_CODE_TOOL_NAMES = set(DEEPSEEK_TAG_TO_TOOL.values()) | {
     "Bash", "Read", "Write", "Edit", "MultiEdit",
@@ -419,11 +404,11 @@ def parse_native_tag(tag_name: str, inner: str) -> dict | None:
     into an Anthropic tool_use block.
 
     Handles three cases:
-      1. tag_name is already a valid CyberStrikeAI tool name  (e.g. "Bash", "Scan")
-      2. tag_name maps via DEEPSEEK_TAG_TO_TOOL               (e.g. "editor" -> "Edit")
+      1. tag_name is already a valid Claude Code tool name  (e.g. "Bash")
+      2. tag_name maps via DEEPSEEK_TAG_TO_TOOL             (e.g. "editor" -> "Edit")
       3. Unknown tag -- use the tag name verbatim so the ToolFilter can decide
     """
-    # Prefer exact match in CyberStrikeAI tool names (preserves casing like "WebFetch")
+    # Prefer exact match in Claude Code tool names (preserves casing like "WebFetch")
     if tag_name in CLAUDE_CODE_TOOL_NAMES:
         tool_name = tag_name
     else:
@@ -491,7 +476,7 @@ def parse_response(text: str) -> list:
 
     for m in pattern.finditer(text):
         # Preserve text exactly — no strip() — so backtick code blocks and
-        # newlines render correctly in CyberStrikeAI.
+        # newlines render correctly in Claude Code.
         before = text[last:m.start()]
         if before and not found_tool:
             blocks.append({"type": "text", "text": before})
@@ -542,198 +527,26 @@ def parse_response(text: str) -> list:
 
 class ToolFilter:
     """
-    Wraps call_deepseek + parse_response with retry logic.
-
-    A response is considered INVALID (and retried) when:
-      - CyberStrikeAI sent tools but DeepSeek returned ONLY text (no tool_use blocks)
-        AND the raw text looks like it was trying to call a tool (contains keyword signals)
-      - A tool_use block has a blank or missing name
-      - A tool_use block has malformed / empty input when the tool schema requires params
-      - JSON inside <tool_use> is broken (parse_response already falls back to text,
-        so we catch that here by checking for tool signals in text blocks)
-
-    On failure: re-prompts DeepSeek with a strict correction instruction appended,
-    up to MAX_RETRIES times. Falls back to the last response on exhaustion.
+    Wraps call_deepseek_managed + parse_response. No retry logic — a single
+    call is made and its parsed blocks are returned as-is.
     """
-
-    MAX_RETRIES = 3
-
-    # Keywords that ONLY appear when DeepSeek is trying (and failing) to emit a tool call.
-    # Deliberately excludes ```bash / ```python — those are normal markdown in text answers.
-    # Deliberately excludes "$ " — common in shell examples in reports.
-    TOOL_INTENT_SIGNALS = [
-        "<tool_use>",
-        # DeepSeek native tags
-        "<bash>", "<python>", "<editor>",
-        # Phrase signals
-        "I'll run", "I will run", "Let me run",
-        "I'll use the", "I will use the",
-        "I'll call", "I will call",
-        "Executing tool:", "Calling tool:",
-        # CyberStrikeAI tool name mentions in action context
-        "I'll use Bash", "I'll use Read", "I'll use Write", "I'll use Edit",
-        "I'll use WebFetch", "I'll use WebSearch",
-        "I'll use Agent", "I'll use Scan", "I'll use Recon",
-        "I'll use Exploit", "I'll use Enumerate",
-        "using the Bash tool", "using the Read tool",
-        "call the Bash", "call the Read", "call the Write",
-    ]
-
-    # If any of these appear, the response is clearly intentional prose — skip retry.
-    PROSE_SIGNALS = [
-        "### ", "## ", "# ",
-        "**Vulnerability", "**SQL", "**Remediation",
-        "Penetration Test", "pentest",
-        "Here is", "Here's", "Summary", "Finding",
-    ]
-
-    RETRY_INSTRUCTION = (
-        "\n\n[SYSTEM CORRECTION] Your previous response did not emit a valid <tool_use> block "
-        "even though a tool call was required. "
-        "You MUST output the tool call using ONLY this format — nothing else, no preamble:\n"
-        "<tool_use>\n"
-        "{\"name\": \"TOOL_NAME\", \"id\": \"call_UNIQUE_ID\", \"input\": {PARAMETERS}}\n"
-        "</tool_use>\n"
-        "Try again now."
-    )
 
     def __init__(self, tools: list, messages: list | None = None):
         """
         tools:    the Anthropic tool definitions list from the current request.
-        messages: the full conversation history (optional). Used to collect
-                  tool names already used in earlier assistant turns — these
-                  are always considered valid so nested / chained calls aren't
-                  rejected as "unknown".
+        messages: the full conversation history (optional, kept for parity
+                  with the previous signature; unused now that retry/
+                  validation logic has been removed).
         """
-        self._valid_names  = {t["name"] for t in tools} if tools else set()
-        self._required_params = {}
-        for t in (tools or []):
-            schema   = t.get("input_schema", {})
-            required = schema.get("required", [])
-            if required:
-                self._required_params[t["name"]] = required
-
-        # Augment valid names with any tool already invoked in the history
-        # (handles nested / chained scenarios where the same tool re-appears
-        # or a tool from a prior turn shows up in a follow-up call).
-        for msg in (messages or []):
-            content = msg.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    name = block.get("name", "").strip()
-                    if name:
-                        self._valid_names.add(name)
+        pass
 
     # ── public entry point ────────────────────────────────────────────────────
 
-    def call_with_filter(self, session: dict, prompt: str) -> tuple[str, list]:
-        """
-        Returns (raw_text, validated_blocks).
-        Retries automatically on tool-parse failure.
-        """
-        current_prompt = prompt
-        last_text      = ""
-        last_blocks    = []
-
-        for attempt in range(1, self.MAX_RETRIES + 1):
-            raw_text, _ = call_deepseek_with_empty_retry(session, current_prompt)
-            blocks      = parse_response(raw_text)
-            last_text   = raw_text
-            last_blocks = blocks
-
-            failure = self._failure_reason(blocks, raw_text)
-            if failure is None:
-                if attempt > 1:
-                    print(f"[tool_filter] ✓ passed on attempt {attempt}", flush=True)
-                return raw_text, blocks
-
-            print(
-                f"[tool_filter] attempt {attempt}/{self.MAX_RETRIES} FAILED — {failure}",
-                flush=True,
-            )
-
-            if attempt < self.MAX_RETRIES:
-                # Append the raw model reply + correction nudge to the prompt
-                current_prompt = (
-                    current_prompt.rstrip()
-                    + f"\n\nAssistant: {raw_text}"
-                    + f"\n\nHuman:{self.RETRY_INSTRUCTION}"
-                    + "\n\nAssistant:"
-                )
-
-        print(
-            f"[tool_filter] exhausted {self.MAX_RETRIES} retries — returning best effort",
-            flush=True,
-        )
-        return last_text, last_blocks
-
-    # ── private validation ────────────────────────────────────────────────────
-
-    def _failure_reason(self, blocks: list, raw_text: str) -> str | None:
-        """
-        Returns a human-readable failure reason string, or None if blocks are valid.
-        Only validates tool blocks when the request actually included tools.
-        """
-        if not self._valid_names:
-            # No tools in this request — any text response is fine
-            return None
-
-        # Empty response = DeepSeek timeout/rate-limit, not a tool-format failure.
-        # Retrying won't fix it and just wastes quota.
-        if not raw_text.strip():
-            return None
-
-        tool_blocks = [b for b in blocks if b.get("type") == "tool_use"]
-        text_blocks = [b for b in blocks if b.get("type") == "text"]
-
-        # Case 1: No tool blocks at all — check if DeepSeek was trying but failed
-        if not tool_blocks:
-            combined_text = " ".join(b.get("text", "") for b in text_blocks)
-
-            # If the response looks like deliberate prose (report, summary, explanation)
-            # then the model chose not to call a tool — that's valid, don't retry.
-            if self._looks_like_prose(combined_text) or self._looks_like_prose(raw_text):
-                return None
-
-            if self._looks_like_tool_intent(combined_text) or self._looks_like_tool_intent(raw_text):
-                return "tool intent detected in text but no tool_use block emitted"
-
-            # No tool intent, no prose signals — model answered normally, accept it
-            return None
-
-        # Case 2: Validate each tool block
-        for block in tool_blocks:
-            name  = block.get("name", "").strip()
-            input_ = block.get("input", {})
-
-            if not name:
-                return "tool_use block has empty name"
-
-            if self._valid_names and name not in self._valid_names:
-                # Only hard-fail if the name looks completely fabricated (contains
-                # spaces or is a single generic word like "tool"). Legitimate nested
-                # calls often use names that weren't in the original tools list.
-                if " " in name or name.lower() in {"tool", "function", "call", "action"}:
-                    return f"unknown tool name: {repr(name)}"
-                # Otherwise accept it — it may be from a nested or chained context
-                print(f"[tool_filter] allowing unlisted tool name {repr(name)} (may be nested)", flush=True)
-
-            required = self._required_params.get(name, [])
-            missing  = [p for p in required if p not in input_]
-            if missing:
-                return f"tool {repr(name)} missing required params: {missing}"
-
-        return None  # all good
-
-    def _looks_like_tool_intent(self, text: str) -> bool:
-        tl = text.lower()
-        return any(sig.lower() in tl for sig in self.TOOL_INTENT_SIGNALS)
-
-    def _looks_like_prose(self, text: str) -> bool:
-        """Returns True if the text is clearly intentional prose, not a failed tool call."""
-        return any(sig in text for sig in self.PROSE_SIGNALS)
+    def call_with_filter(self, session_key: str, prompt: str) -> tuple[str, list]:
+        """Returns (raw_text, blocks). No retries."""
+        raw_text, _ = call_deepseek_managed(session_key, prompt)
+        blocks = parse_response(raw_text)
+        return raw_text, blocks
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
@@ -743,11 +556,18 @@ def sse(event: str, data: dict) -> str:
 
 # ── DeepSeek call (collects full response) ────────────────────────────────────
 
-def call_deepseek(session: dict, prompt: str) -> tuple[str, int | None]:
-    """Send prompt to DeepSeek, return (full_text, new_message_id)."""
+def call_deepseek(session: dict, prompt: str, parent_message_id: int | None) -> tuple[str, int | None, bool]:
+    """
+    Send prompt to DeepSeek, return (full_text, new_message_id, rate_limited).
+
+    parent_message_id: the DS assistant message_id from the previous reply
+                        in this chat session (None for the very first
+                        message of the session).
+    rate_limited:      True if DeepSeek responded with finish_reason
+                        "rate_limit_reached" ("Messages too frequent").
+    """
     http       = session["http"]
     ds_session = session["ds_session_id"]
-    root_id    = session["root_message_id"]
 
     challenge_data = get_pow_challenge(http)
     answer = hasher.solve(
@@ -765,8 +585,8 @@ def call_deepseek(session: dict, prompt: str) -> tuple[str, int | None]:
     }
     body = {
         "chat_session_id":   ds_session,
-        "parent_message_id": root_id,
-        "model_type":        "default" if root_id is None else None,
+        "parent_message_id": parent_message_id,
+        "model_type":        "default" if parent_message_id is None else None,
         "prompt":            prompt,
         "ref_file_ids":      [],
         "thinking_enabled":  False,
@@ -775,8 +595,11 @@ def call_deepseek(session: dict, prompt: str) -> tuple[str, int | None]:
         "preempt":           False,
     }
 
-    full_text   = ""
-    new_root_id = None
+    full_text    = ""
+    new_msg_id   = None
+    line_count   = 0
+    last_lines   = []
+    rate_limited = False
 
     with http.post(
         f"{BASE_URL}/api/v0/chat/completion",
@@ -785,17 +608,33 @@ def call_deepseek(session: dict, prompt: str) -> tuple[str, int | None]:
         stream=True,
         timeout=120,
     ) as resp:
+        print(f"[deepseek] HTTP {resp.status_code} content-type={resp.headers.get('content-type')}", flush=True)
         resp.raise_for_status()
         if "application/json" in resp.headers.get("content-type", ""):
-            raise RuntimeError(f"DeepSeek API error: {resp.json()}")
+            err_body = resp.json()
+            print(f"[deepseek] JSON error body: {err_body}", flush=True)
+            raise RuntimeError(f"DeepSeek API error: {err_body}")
 
         for raw_line in resp.iter_lines(decode_unicode=True):
-            if not raw_line or not raw_line.startswith("data:"):
+            if not raw_line:
+                continue
+            line_count += 1
+            last_lines.append(raw_line)
+            if len(last_lines) > 5:
+                last_lines.pop(0)
+            if not raw_line.startswith("data:"):
                 continue
             try:
                 pl = json.loads(raw_line[5:].strip())
             except json.JSONDecodeError:
                 continue
+
+            # Surface explicit error payloads from DeepSeek
+            if pl.get("code") not in (None, 0):
+                print(f"[deepseek] error payload in stream: {pl}", flush=True)
+
+            if pl.get("finish_reason") == "rate_limit_reached" or pl.get("type") == "error" and "frequent" in str(pl.get("content", "")).lower():
+                rate_limited = True
 
             v = pl.get("v")
             p = pl.get("p", "")
@@ -804,7 +643,7 @@ def call_deepseek(session: dict, prompt: str) -> tuple[str, int | None]:
 
             if isinstance(v, dict) and "response" in v:
                 resp_obj = v["response"]
-                new_root_id = resp_obj.get("message_id")
+                new_msg_id = resp_obj.get("message_id")
                 for f in resp_obj.get("fragments", []):
                     if f.get("type") == "RESPONSE":
                         chunk = f.get("content", "")
@@ -816,36 +655,75 @@ def call_deepseek(session: dict, prompt: str) -> tuple[str, int | None]:
             if chunk:
                 full_text += chunk
 
-    # Pin root after first reply only — all subsequent turns are siblings of
-    # message 1, keeping the DeepSeek conversation memory flat and bounded.
-    if new_root_id is not None and session["root_message_id"] is None:
-        session["root_message_id"] = new_root_id
+    if not full_text.strip():
+        print(f"[deepseek] EMPTY result — {line_count} raw lines received, last lines: {last_lines}", flush=True)
+        if rate_limited:
+            print("[deepseek] detected rate_limit_reached", flush=True)
 
     print(f"[deepseek raw]\n{repr(full_text[:500])}\n", flush=True)
-    return full_text, new_root_id
+    return full_text, new_msg_id, rate_limited
 
 
-def call_deepseek_with_empty_retry(session: dict, prompt: str, max_empty_retries: int = 3) -> tuple[str, int | None]:
+def call_deepseek_managed(session_key: str, prompt: str, _depth: int = 0) -> tuple[str, int | None]:
     """
-    Wraps call_deepseek: if the response is empty (DeepSeek returned ''),
-    wait 3 seconds and retry up to max_empty_retries times before giving up.
+    Sends `prompt` using a "rewrite until empty, then advance" strategy:
+
+      - The session keeps an `anchor_message_id` (None for a fresh session).
+      - Every call uses `parent_message_id = anchor_message_id` — i.e. it
+        keeps "rewriting"/regenerating the sibling reply at that slot rather
+        than growing the conversation chain. This is what avoids the
+        "Messages too frequent" chain-length rate limit.
+      - As long as DeepSeek keeps returning a non-empty result, the anchor
+        stays the same and we just keep rewriting at that slot for
+        subsequent prompts too... UNTIL a call comes back empty
+        (rate-limited or otherwise).
+      - On an empty result: retry the SAME anchor a few times (in case it's
+        transient). If still empty, advance — the anchor moves forward to
+        the most recent successful response's message_id, and THIS prompt
+        is sent against the new anchor (start of a new "rewrite" run).
+      - If even a freshly-advanced anchor returns empty, fall back to a
+        brand new session/conversation (bounded retries).
     """
-    for attempt in range(1, max_empty_retries + 1):
-        full_text, new_root_id = call_deepseek(session, prompt)
+    MAX_SAME_ANCHOR_RETRIES = 3  # retries against the same anchor before advancing
+    MAX_SESSIONS            = 3  # cap on full session resets
+
+    session = store.get_or_create(session_key)
+    anchor  = session["anchor_message_id"]
+
+    # ── Try rewriting against the current anchor ───────────────────────────
+    delay = 2
+    for attempt in range(1, MAX_SAME_ANCHOR_RETRIES + 1):
+        full_text, new_id, rate_limited = call_deepseek(session, prompt, anchor)
         if full_text.strip():
-            return full_text, new_root_id
-        print(
-            f"[deepseek] empty response on attempt {attempt}/{max_empty_retries} — "
-            f"waiting 3s before retry...",
-            flush=True,
-        )
-        time.sleep(3)
+            if new_id is not None:
+                session["last_good_message_id"] = new_id
+            return full_text, new_id
 
-    print("[deepseek] all empty-response retries exhausted — returning empty string", flush=True)
-    return "", None
+        if rate_limited and attempt < MAX_SAME_ANCHOR_RETRIES:
+            print(f"[deepseek] rate limited on anchor={anchor} — retry {attempt + 1}/{MAX_SAME_ANCHOR_RETRIES} in {delay}s", flush=True)
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            continue
+        break
+
+    # ── Empty on this anchor — advance to a new anchor and retry there ─────
+    if _depth + 1 >= MAX_SESSIONS:
+        print("[deepseek] anchor-advance budget exhausted — returning empty", flush=True)
+        return "", None
+
+    if session.get("last_good_message_id") is not None:
+        print(f"[deepseek] empty on anchor={anchor} — advancing anchor to {session['last_good_message_id']}", flush=True)
+        session["anchor_message_id"] = session["last_good_message_id"]
+        session["last_good_message_id"] = None
+        return call_deepseek_managed(session_key, prompt, _depth=_depth + 1)
+
+    # No prior good message to advance to — the session itself is dead.
+    print("[deepseek] empty with no advanceable anchor — starting new session/conversation", flush=True)
+    store.reset(session_key)
+    return call_deepseek_managed(session_key, prompt, _depth=_depth + 1)
 
 
-def stream_response_as_anthropic(session: dict, prompt: str, model: str, input_tokens: int, tool_filter: "ToolFilter"):
+def stream_response_as_anthropic(session_key: str, prompt: str, model: str, input_tokens: int, tool_filter: "ToolFilter"):
     """
     Calls DeepSeek, collects full response, parses content blocks,
     then streams them as proper Anthropic SSE events.
@@ -867,14 +745,14 @@ def stream_response_as_anthropic(session: dict, prompt: str, model: str, input_t
     })
     yield sse("ping", {"type": "ping"})
 
-    # Collect full response from DeepSeek — filtered + retried if tool parsing fails
-    full_text, blocks = tool_filter.call_with_filter(session, prompt)
+    # Collect full response from DeepSeek
+    full_text, blocks = tool_filter.call_with_filter(session_key, prompt)
 
     output_tokens = max(1, len(full_text.split()))
     stop_reason   = "end_turn"
 
     # Merge consecutive text blocks so they stream as one block — avoids
-    # spurious newlines that CyberStrikeAI inserts between separate content blocks.
+    # spurious newlines that Claude Code inserts between separate content blocks.
     merged = []
     for block in blocks:
         if block["type"] == "text" and merged and merged[-1]["type"] == "text":
@@ -933,10 +811,37 @@ app   = Flask(__name__)
 hasher: DeepSeekHash = None
 store = SessionStore()
 
+# ── Global request pacing ────────────────────────────────────────────────────
+# Always wait this many seconds before processing each request.
+
+REQUEST_DELAY_SECONDS = 5.0
+_processing_lock = threading.Lock()
+
+
+def enforce_request_pacing():
+    """Serialize requests: only one request is processed at a time.
+    Each request waits for the lock, then sleeps for the fixed delay
+    with a countdown, while holding the lock."""
+    _processing_lock.acquire()
+    remaining = int(REQUEST_DELAY_SECONDS)
+    frac = REQUEST_DELAY_SECONDS - remaining
+    for i in range(remaining, 0, -1):
+        print(f"[delay] {i}...", flush=True)
+        time.sleep(1)
+    if frac > 0:
+        time.sleep(frac)
+    print("[delay] 0", flush=True)
+
+
+def mark_request_finished():
+    """Release the processing lock so the next request can proceed."""
+    if _processing_lock.locked():
+        _processing_lock.release()
+
 
 def is_permission_request(system: str) -> bool:
     """
-    Detect CyberStrikeAI permission-evaluation requests.
+    Detect Claude Code permission-evaluation requests.
     These have a very specific system prompt asking to output <decision>allow</decision>
     or <decision>block</decision>. We match on highly specific phrases only.
     """
@@ -989,7 +894,7 @@ def _allow_response(stream: bool, model: str):
 def messages():
     body     = request.get_json(force=True)
     msgs     = body.get("messages", [])
-    model    = body.get("model", "cyberstrike-pro")
+    model    = body.get("model", "claude-sonnet-4-20250514")
     max_tok  = body.get("max_tokens", 8096)
     stream   = body.get("stream", False)
     system   = body.get("system", "")
@@ -1005,35 +910,42 @@ def messages():
     # Log first 300 chars of system so we can tune the permission detector
     print(f"[system prefix] {repr(system[:300])}", flush=True)
 
-    # Auto-approve permission evaluation requests from CyberStrikeAI
+    # Auto-approve permission evaluation requests from Claude Code
     if is_permission_request(system):
         print("[permission] auto-approving", flush=True)
         return _allow_response(stream, model)
 
     prompt       = build_prompt(system, msgs, tools)
     input_tokens = max(1, len(prompt.split()))
-    session      = store.get_or_create("global")
+    session_key  = "global"
+    store.get_or_create(session_key)  # ensure session exists
     tf           = ToolFilter(tools, msgs)          # ← filter created per-request
 
     if stream:
         def generate():
+            enforce_request_pacing()
             try:
-                yield from stream_response_as_anthropic(session, prompt, model, input_tokens, tf)
+                yield from stream_response_as_anthropic(session_key, prompt, model, input_tokens, tf)
             except Exception as e:
                 print(f"[error] {e}", file=sys.stderr)
                 import traceback; traceback.print_exc()
                 yield sse("error", {"type": "error", "error": {"type": "api_error", "message": str(e)}})
+            finally:
+                mark_request_finished()
 
         return Response(generate(), mimetype="text/event-stream",
                         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
 
     # Non-streaming
+    enforce_request_pacing()
     try:
-        full_text, blocks = tf.call_with_filter(session, prompt)   # ← filtered call
+        full_text, blocks = tf.call_with_filter(session_key, prompt)   # ← managed call
         output_toks  = max(1, len(full_text.split()))
         stop_reason  = "tool_use" if any(b["type"] == "tool_use" for b in blocks) else "end_turn"
     except Exception as e:
         return jsonify({"type": "error", "error": {"type": "api_error", "message": str(e)}}), 500
+    finally:
+        mark_request_finished()
 
     return jsonify({
         "id":            f"msg_{uuid.uuid4().hex[:24]}",
@@ -1069,9 +981,9 @@ def count_tokens():
 def models():
     return jsonify({
         "data": [
-            {"id": "cyberstrike-ultra",   "object": "model"},
-            {"id": "cyberstrike-pro",     "object": "model"},
-            {"id": "cyberstrike-fast",    "object": "model"},
+            {"id": "claude-opus-4-5",          "object": "model"},
+            {"id": "claude-sonnet-4-20250514",  "object": "model"},
+            {"id": "claude-haiku-4-5-20251001", "object": "model"},
         ],
         "object": "list",
     })
@@ -1107,10 +1019,10 @@ if __name__ == "__main__":
     hasher = DeepSeekHash(WASM_PATH)
     print("OK")
 
-    print(f"\nCyberStrikeAI proxy listening on http://0.0.0.0:{PORT}")
+    print(f"\nDeepSeek proxy listening on http://0.0.0.0:{PORT}")
     print(f"\nIn your shell:")
     print(f'  export ANTHROPIC_BASE_URL="http://localhost:{PORT}"')
-    print(f'  export ANTHROPIC_API_KEY="cyberstrike-local-key"')
+    print(f'  export ANTHROPIC_API_KEY="local-proxy-key"')
     print()
 
     app.run(host="0.0.0.0", port=PORT, threaded=True)
