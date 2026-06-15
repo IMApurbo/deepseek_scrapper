@@ -815,16 +815,28 @@ store = SessionStore()
 # Always wait this many seconds before processing each request.
 
 REQUEST_DELAY_SECONDS = 5.0
+_processing_lock = threading.Lock()
 
 
 def enforce_request_pacing():
-    """Always sleep for a fixed delay before processing a request."""
-    time.sleep(REQUEST_DELAY_SECONDS)
+    """Serialize requests: only one request is processed at a time.
+    Each request waits for the lock, then sleeps for the fixed delay
+    with a countdown, while holding the lock."""
+    _processing_lock.acquire()
+    remaining = int(REQUEST_DELAY_SECONDS)
+    frac = REQUEST_DELAY_SECONDS - remaining
+    for i in range(remaining, 0, -1):
+        print(f"[delay] {i}...", flush=True)
+        time.sleep(1)
+    if frac > 0:
+        time.sleep(frac)
+    print("[delay] 0", flush=True)
 
 
 def mark_request_finished():
-    """No-op (kept for call-site compatibility)."""
-    pass
+    """Release the processing lock so the next request can proceed."""
+    if _processing_lock.locked():
+        _processing_lock.release()
 
 
 def is_permission_request(system: str) -> bool:
