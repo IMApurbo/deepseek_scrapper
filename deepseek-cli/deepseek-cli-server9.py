@@ -1114,17 +1114,55 @@ def parse_response(text: str, valid_tools: set[str] | None = None) -> list:
             print(f"[parse_response] fallback-A fence parser rescued {sum(1 for b in blocks if b['type']=='tool_use')} tool(s)", flush=True)
 
     # ── Fallback B: rescue fenced bash/python/sh/shell blocks as Bash tool calls ─
-    # DeepSeek sometimes generates:
-    #   ```bash\ncurl ...\n```  or  ```python\nimport requests...\n```
-    # instead of invoking the Bash tool. These blocks are NEVER executed by the
-    # caller, so we convert them here — but only when:
-    #   1. No tool_use block was already found (we don't want to duplicate)
-    #   2. The "Bash" tool is in the valid tool set
-    #   3. The fenced block contains non-trivial content (not just a comment)
+    # ONLY fires when the fenced block is an EXECUTION attempt (no tool call found)
+    # AND the surrounding context does NOT indicate it is display/informational.
+    #
+    # Display-intent signals (skip conversion):
+    #   "you can run manually", "run in your terminal", "here's the command",
+    #   "scope gate is blocking", "run outside", etc.
+    # These mean DeepSeek is showing the user a reference command, not trying to
+    # execute it. Converting those blocks causes infinite retry loops when the
+    # command gets blocked (e.g. by a scope gate) and DeepSeek keeps repeating
+    # the same display-only response.
     if not any(b["type"] == "tool_use" for b in blocks):
         bash_available = not valid_tools or "Bash" in valid_tools
         if bash_available:
-            # Match ```bash, ```python, ```sh, ```shell (case-insensitive)
+            # Phrases in the 300 chars BEFORE a fenced block that signal
+            # "this is for the user to run manually, not for me to execute".
+            # Any match → skip that block entirely (leave it as display text).
+            DISPLAY_INTENT_PHRASES = (
+                "run manually",
+                "run in your terminal",
+                "run this in your terminal",
+                "run it in your terminal",
+                "execute manually",
+                "execute in your terminal",
+                "run outside",
+                "run directly in",
+                "you can run",
+                "you could run",
+                "you'll need to run",
+                "you will need to run",
+                "here's the command",
+                "here is the command",
+                "here's a command",
+                "here is a command",
+                "here's the masscan",
+                "here's the nmap",
+                "here's the curl",
+                "scope gate is blocking",
+                "scope gate",
+                "authorized scope",
+                "outside the tool",
+                "in your own terminal",
+                "paste this",
+                "copy this",
+                "run this yourself",
+                "run it yourself",
+                "adjust the",          # "adjust the --rate parameter" = explanatory
+                "notes:",               # bullet-note section = explanatory
+            )
+
             exec_fence_pat = re.compile(
                 r"```(?P<lang>bash|python3?|sh|shell|zsh)\n(?P<code>.*?)```",
                 re.DOTALL | re.IGNORECASE,
@@ -1138,41 +1176,63 @@ def parse_response(text: str, valid_tools: set[str] | None = None) -> list:
                 lang = fm.group("lang").lower()
                 code = fm.group("code").strip()
 
-                # Skip trivially empty blocks
+                # Skip trivially empty or comment-only blocks
                 if not code or code.startswith("#"):
                     continue
 
-                # Strip any inline PATH workaround narration that precedes the block
-                # (e.g. "The PATH environment variable is not being preserved correctly…")
+                # Check the 300 chars immediately before this block for display intent
+                context_before = full_text_b[max(0, fm.start() - 300):fm.start()].lower()
+                if any(phrase in context_before for phrase in DISPLAY_INTENT_PHRASES):
+                    print(
+                        f"[fallback-B] skipping display-intent fenced block "
+                        f"(matched display phrase in context): {repr(code[:60])}",
+                        flush=True,
+                    )
+                    continue
+
+                # Also check the whole response for a scope-gate / "blocked" indicator —
+                # if DeepSeek says the command was blocked, the fenced block is its
+                # suggested manual alternative, not an execution attempt.
+                if any(phrase in full_text_b.lower() for phrase in (
+                    "scope gate",
+                    "blocked by",
+                    "is blocking",
+                    "not authorized",
+                    "outside the authorized",
+                    "authorized scope",
+                )):
+                    print(
+                        f"[fallback-B] skipping — response contains scope-block language: "
+                        f"{repr(code[:60])}",
+                        flush=True,
+                    )
+                    continue
+
+                # This block looks like a genuine execution attempt — convert it.
                 before = full_text_b[last_pos_b:fm.start()]
-                # Remove narration lines that are PATH-workaround boilerplate
-                cleaned_before_lines = []
-                for line in before.splitlines():
-                    low = line.lower()
-                    if any(kw in low for kw in (
-                        "path environment variable",
-                        "not being preserved",
-                        "use the full path",
-                        "use full path",
-                        "let me switch approach",
-                        "let me use python",
-                        "use python's `requests`",
-                        "avoid the path issue",
-                        "avoid path issue",
-                    )):
-                        continue  # drop these narrative lines
-                    cleaned_before_lines.append(line)
-                cleaned_before = "\n".join(cleaned_before_lines).strip()
+                # Strip PATH-workaround narration lines from surrounding text
+                PATH_WORKAROUND_PHRASES = (
+                    "path environment variable",
+                    "not being preserved",
+                    "use the full path",
+                    "use full path",
+                    "let me switch approach",
+                    "let me use python",
+                    "use python's `requests`",
+                    "avoid the path issue",
+                    "avoid path issue",
+                )
+                cleaned_before = "\n".join(
+                    line for line in before.splitlines()
+                    if not any(kw in line.lower() for kw in PATH_WORKAROUND_PHRASES)
+                ).strip()
                 if cleaned_before:
                     rebuilt_b.append({"type": "text", "text": cleaned_before})
 
-                # Build command: python blocks get wrapped in python3 -c or a heredoc
+                # Build command string
                 if lang in ("python", "python3"):
-                    # Write to a temp file approach is safer for multi-line Python
-                    escaped = code.replace("'", "'\\''")
                     command = f"python3 << 'PYEOF'\n{code}\nPYEOF"
                 else:
-                    # bash/sh/shell/zsh — run directly
                     command = code
 
                 rebuilt_b.append({
