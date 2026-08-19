@@ -651,6 +651,20 @@ _SKIP_TAGS = {
 _HIGH_RISK_NATIVE_TOOLS = {"Write", "Edit", "MultiEdit", "Bash"}
 _LEADING_PROSE_WARN_CHARS = 15
 
+# Unfilled template placeholders — "curl ... -u username:password ...",
+# "rtsp://USER:PASS@host/..." — that DeepSeek writes into a fenced command
+# as an example for the human to copy, fill in, and run themselves. Observed
+# in practice: the fenced-bash rescue below can't distinguish that from a
+# real intended action and auto-executes the template verbatim, placeholder
+# and all. A literal, unfilled placeholder is a near-zero-false-positive
+# signal the block is illustrative rather than an instruction to run now —
+# real commands essentially never contain these exact tokens.
+_PLACEHOLDER_CREDENTIAL_PATTERN = re.compile(
+    r"user:pass\b|username:password\b|your[_-]?user(?:name)?\b|your[_-]?pass(?:word)?\b|"
+    r"<user(?:name)?>|<pass(?:word)?>|\{user(?:name)?\}|\{pass(?:word)?\}",
+    re.IGNORECASE,
+)
+
 
 def _strip_json_fences(raw: str) -> str:
     """Remove markdown code fences DeepSeek sometimes wraps JSON in."""
@@ -1349,6 +1363,19 @@ def parse_response(text: str, valid_tools: set[str] | None = None) -> list:
         for fm in bash_fence_pat.finditer(full_text_so_far):
             command = fm.group(1).strip()
             if not command:
+                continue
+            if _PLACEHOLDER_CREDENTIAL_PATTERN.search(command):
+                # Observed in practice: DeepSeek offers a fenced command as a
+                # template for the user to fill in and run themselves (e.g.
+                # "If you have credentials, use them: curl ... -u
+                # username:password ..."), and this rescue can't tell that
+                # apart from a genuinely intended action — so it auto-executes
+                # the template with the placeholder still in it, which then
+                # confuses DeepSeek about its own prior output on the next
+                # turn. An unfilled placeholder credential is a near-zero-
+                # false-positive signal that this block is illustrative, not
+                # an instruction to run right now — leave it as plain text.
+                print(f"[parse_response] skipping bash-fence rescue — looks like an unfilled credential template: {command[:100]!r}", flush=True)
                 continue
             before = full_text_so_far[last_pos:fm.start()]
             if before.strip():
