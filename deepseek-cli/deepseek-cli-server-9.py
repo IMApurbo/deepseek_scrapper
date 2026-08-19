@@ -1213,6 +1213,47 @@ def parse_response(text: str, valid_tools: set[str] | None = None) -> list:
             blocks = rebuilt
             print(f"[parse_response] fallback fence parser rescued {sum(1 for b in blocks if b['type']=='tool_use')} tool(s)", flush=True)
 
+    # ── Fallback: if STILL no tool_use blocks, try plain fenced shell code ────
+    # DeepSeek very often ignores the <tool_use> instructions entirely and
+    # just prints the command in an ordinary markdown fence:
+    #   ```bash
+    #   ls -la
+    #   ```
+    # That's plain text to Claude Code — it gets displayed, never executed.
+    # Only rescue when "Bash" was actually offered this turn (so we're not
+    # guessing at a tool the caller didn't provide) and every fenced block
+    # found is treated as one Bash call, in order, same as the json rescue
+    # above. This can't bypass Claude Code's own tool-permission prompts —
+    # it only produces a real tool_use block instead of inert text.
+    if (valid_tools and "Bash" in valid_tools
+            and not any(b["type"] == "tool_use" for b in blocks)):
+        bash_fence_pat = re.compile(r"```(?:bash|sh|shell|zsh)\s*\n(.*?)```", re.DOTALL)
+        rebuilt: list[dict] = []
+        replaced = False
+        full_text_so_far = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        last_pos = 0
+        for fm in bash_fence_pat.finditer(full_text_so_far):
+            command = fm.group(1).strip()
+            if not command:
+                continue
+            before = full_text_so_far[last_pos:fm.start()]
+            if before.strip():
+                rebuilt.append({"type": "text", "text": before})
+            rebuilt.append({
+                "type":  "tool_use",
+                "id":    f"toolu_{uuid.uuid4().hex[:16]}",
+                "name":  "Bash",
+                "input": {"command": command},
+            })
+            last_pos = fm.end()
+            replaced = True
+        if replaced:
+            tail = full_text_so_far[last_pos:]
+            if tail.strip():
+                rebuilt.append({"type": "text", "text": tail})
+            blocks = rebuilt
+            print(f"[parse_response] fallback bash-fence parser rescued {sum(1 for b in blocks if b['type']=='tool_use')} command(s)", flush=True)
+
     print(
         f"[parsed blocks] {[b['type'] + ('/' + b.get('name','')) if b['type'] == 'tool_use' else b['type'] for b in blocks]}",
         flush=True,
