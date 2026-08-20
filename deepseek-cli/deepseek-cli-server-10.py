@@ -429,6 +429,24 @@ CRITICAL TOOL-CALLING RULES (READ CAREFULLY):
    Step 3: System returns <tool_result>
    Step 4: You read result and respond naturally
 
+7. NEVER USE ```bash / ```sh / ```shell / ```zsh FENCES — FOR ANYTHING:
+   The ONLY way to actually run a command is a <tool_use> block. A fenced
+   code block is NEVER executed — it is just displayed to the user. Do not
+   use a bash/sh/shell/zsh fence even for an example, a suggestion, or a
+   command you expect the human to copy and run manually themselves — those
+   fences read as commands and must not be used at all.
+   ❌ WRONG (illustrative example in a bash fence):
+      ```bash
+      hydra -l admin -P wordlist.txt ssh://target
+      ```
+   ✅ CORRECT (same example, shown for the human to read only — still
+      renders as highlighted inline code, just not a triple-fenced block):
+      Run this yourself if you want to try it: `hydra -l admin -P wordlist.txt ssh://target`
+   Always use inline single backticks around example/manual commands,
+   including multi-line ones (one pair of backticks per line). Never use a
+   triple-fence of any kind for a command. If you actually want the command
+   run now, use a real <tool_use> block instead — never a fence.
+
 EXAMPLE - Correct tool call for listing files:
 <tool_use>
 {"name": "Bash", "id": "call_abc123", "input": {"command": "ls -la"}}
@@ -469,6 +487,12 @@ TOOL_CALL_REMINDER = (
     "No \"let me...\" / \"I'll...\" announcement first, nothing after it — just the block.\n"
     "Writing a sentence like \"I'll explore this in detail\" or \"Let me check this\"\n"
     "and then stopping is a failure, even if the sentence sounds reasonable.\n"
+    "NEVER output a ```bash, ```sh, ```shell, or ```zsh fenced code block — not even\n"
+    "for an example or a command meant for the human to run manually. Those fences\n"
+    "are banned with no exceptions, no matter the language tag on the fence. For a\n"
+    "command you want run now, use a real <tool_use> block. For a command you are\n"
+    "only showing/suggesting, use inline single backticks instead — never a\n"
+    "triple-fenced block of any kind.\n"
     "</system-reminder>"
 )
 
@@ -644,27 +668,12 @@ _SKIP_TAGS = {
 # (write/overwrite a file, run a shell command). If DeepSeek ever produces a
 # well-formed one of these while narrating/explaining rather than actually
 # intending to act — e.g. demonstrating its own tool syntax mid-explanation —
-# there's no reliable way to tell that apart from a genuine call, so it gets
-# executed either way. See _warn_if_high_risk_native_call below: this is
-# monitoring only (no behavior change) until real occurrences show whether
-# it's worth restricting.
+# there's no reliable way to tell that apart from a genuine call by shape
+# alone. See _native_call_has_narrative_preamble below: a high-risk native
+# tag preceded by non-trivial prose in the same reply is treated as
+# narration, not a real call, and suppressed instead of executed.
 _HIGH_RISK_NATIVE_TOOLS = {"Write", "Edit", "MultiEdit", "Bash"}
 _LEADING_PROSE_WARN_CHARS = 15
-
-# Unfilled template placeholders — "curl ... -u username:password ...",
-# "rtsp://USER:PASS@host/..." — that DeepSeek writes into a fenced command
-# as an example for the human to copy, fill in, and run themselves. Observed
-# in practice: the fenced-bash rescue below can't distinguish that from a
-# real intended action and auto-executes the template verbatim, placeholder
-# and all. A literal, unfilled placeholder is a near-zero-false-positive
-# signal the block is illustrative rather than an instruction to run now —
-# real commands essentially never contain these exact tokens.
-_PLACEHOLDER_CREDENTIAL_PATTERN = re.compile(
-    r"user:pass\b|username:password\b|your[_-]?user(?:name)?\b|your[_-]?pass(?:word)?\b|"
-    r"<user(?:name)?>|<pass(?:word)?>|\{user(?:name)?\}|\{pass(?:word)?\}",
-    re.IGNORECASE,
-)
-
 
 def _strip_json_fences(raw: str) -> str:
     """Remove markdown code fences DeepSeek sometimes wraps JSON in."""
@@ -848,30 +857,37 @@ def parse_native_tag(tag_name: str, inner: str, valid_tools: set[str] | None = N
     }
 
 
-def _warn_if_high_risk_native_call(tool_name: str, tag_name: str, full_text: str, match_start: int) -> None:
+def _native_call_has_narrative_preamble(tool_name: str, tag_name: str, full_text: str, match_start: int) -> bool:
     """
-    Log-only diagnostic: a native-tag call (<Bash>, <Write>, etc.) for a tool
-    with real side effects, preceded by non-trivial prose in the same reply,
-    is indistinguishable here from DeepSeek demonstrating its own tool syntax
-    mid-explanation rather than actually intending the action — but it still
-    gets executed as real either way (see _HIGH_RISK_NATIVE_TOOLS above).
-    This does not change what gets executed; it only surfaces how often the
-    ambiguous shape actually occurs, so a real fix can be scoped from
-    evidence instead of guessed at.
+    A native-tag call (<Bash>, <Write>, etc.) for a tool with real side
+    effects, preceded by non-trivial prose in the same reply, is
+    indistinguishable here from DeepSeek demonstrating its own tool syntax
+    mid-explanation rather than actually intending the action (see
+    _HIGH_RISK_NATIVE_TOOLS above). Real calls are never supposed to have
+    preamble at all — rule 1 in TOOL_CALL_SYSTEM already requires the tool
+    call to be the first thing in the reply, with no announcement first — so
+    treating "has meaningful leading prose" as "not a real call" doesn't ban
+    anything that was ever supposed to happen; it enforces a policy that was
+    already stated. Suppressing it (rather than executing) is safe because
+    the caller falls back to plain text, and the existing unexecuted-intent
+    retry loop will push DeepSeek to reissue a real, preamble-free call if it
+    actually meant to act.
     """
     if tool_name not in _HIGH_RISK_NATIVE_TOOLS:
-        return
+        return False
     leading = full_text[:match_start].strip()
     if len(leading) > _LEADING_PROSE_WARN_CHARS:
         print(
-            f"[tool_parse][WARN] native <{tag_name}> call resolved to high-risk "
-            f"tool '{tool_name}' with {len(leading)} chars of narrative text "
-            f"before it in the same reply — executing it as real, but this "
-            f"shape is also consistent with DeepSeek demonstrating tool syntax "
-            f"rather than intending the action. Leading text (last 200 chars): "
-            f"{leading[-200:]!r}",
+            f"[tool_parse] suppressing native <{tag_name}> call to high-risk "
+            f"tool '{tool_name}' — {len(leading)} chars of narrative text "
+            f"precede it in the same reply, treating it as text instead of "
+            f"executing it. This shape is consistent with DeepSeek "
+            f"demonstrating tool syntax rather than intending the action. "
+            f"Leading text (last 200 chars): {leading[-200:]!r}",
             flush=True,
         )
+        return True
+    return False
 
 
 def strip_premature_exit_preambles(text: str) -> str:
@@ -1281,8 +1297,12 @@ def parse_response(text: str, valid_tools: set[str] | None = None) -> list:
                 # (after a tool call, skip-tag text is dropped as fabrication)
             else:
                 block = parse_native_tag(tag_name, inner, valid_tools=valid_tools)
-                if block is not None:
-                    _warn_if_high_risk_native_call(block["name"], tag_name, text, segment_start)
+                if block is not None and _native_call_has_narrative_preamble(
+                        block["name"], tag_name, text, segment_start):
+                    # Looks narrated/demonstrated, not intended — treat as text.
+                    if last_tool_end is None:
+                        _append_text(blocks, m.group(0))
+                elif block is not None:
                     blocks.append(block)
                     last_tool_end = segment_end
                 else:
@@ -1341,59 +1361,20 @@ def parse_response(text: str, valid_tools: set[str] | None = None) -> list:
             blocks = rebuilt
             print(f"[parse_response] fallback fence parser rescued {sum(1 for b in blocks if b['type']=='tool_use')} tool(s)", flush=True)
 
-    # ── Fallback: if STILL no tool_use blocks, try plain fenced shell code ────
-    # DeepSeek very often ignores the <tool_use> instructions entirely and
-    # just prints the command in an ordinary markdown fence:
-    #   ```bash
-    #   ls -la
-    #   ```
-    # That's plain text to Claude Code — it gets displayed, never executed.
-    # Only rescue when "Bash" was actually offered this turn (so we're not
-    # guessing at a tool the caller didn't provide) and every fenced block
-    # found is treated as one Bash call, in order, same as the json rescue
-    # above. This can't bypass Claude Code's own tool-permission prompts —
-    # it only produces a real tool_use block instead of inert text.
-    if (valid_tools and "Bash" in valid_tools
-            and not any(b["type"] == "tool_use" for b in blocks)):
-        bash_fence_pat = re.compile(r"```(?:bash|sh|shell|zsh)\s*\n(.*?)```", re.DOTALL)
-        rebuilt: list[dict] = []
-        replaced = False
-        full_text_so_far = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-        last_pos = 0
-        for fm in bash_fence_pat.finditer(full_text_so_far):
-            command = fm.group(1).strip()
-            if not command:
-                continue
-            if _PLACEHOLDER_CREDENTIAL_PATTERN.search(command):
-                # Observed in practice: DeepSeek offers a fenced command as a
-                # template for the user to fill in and run themselves (e.g.
-                # "If you have credentials, use them: curl ... -u
-                # username:password ..."), and this rescue can't tell that
-                # apart from a genuinely intended action — so it auto-executes
-                # the template with the placeholder still in it, which then
-                # confuses DeepSeek about its own prior output on the next
-                # turn. An unfilled placeholder credential is a near-zero-
-                # false-positive signal that this block is illustrative, not
-                # an instruction to run right now — leave it as plain text.
-                print(f"[parse_response] skipping bash-fence rescue — looks like an unfilled credential template: {command[:100]!r}", flush=True)
-                continue
-            before = full_text_so_far[last_pos:fm.start()]
-            if before.strip():
-                rebuilt.append({"type": "text", "text": before})
-            rebuilt.append({
-                "type":  "tool_use",
-                "id":    f"toolu_{uuid.uuid4().hex[:16]}",
-                "name":  "Bash",
-                "input": {"command": command},
-            })
-            last_pos = fm.end()
-            replaced = True
-        if replaced:
-            tail = full_text_so_far[last_pos:]
-            if tail.strip():
-                rebuilt.append({"type": "text", "text": tail})
-            blocks = rebuilt
-            print(f"[parse_response] fallback bash-fence parser rescued {sum(1 for b in blocks if b['type']=='tool_use')} command(s)", flush=True)
+    # ── Intentionally NO fallback for plain fenced shell code ─────────────────
+    # A ```bash/sh/shell/zsh fence is never treated as a real tool call, even
+    # when "Bash" was offered this turn. It used to be auto-"rescued" into a
+    # real Bash tool_use — but DeepSeek uses that exact fence shape both for
+    # commands it actually wants to run AND for purely illustrative examples
+    # ("Recommended Next Steps: `hydra -l admin -P rockyou.txt ...`") that are
+    # meant for the human to review and run manually, and the two are not
+    # reliably distinguishable from the fence alone. Auto-executing the
+    # illustrative case caused unapproved commands (bruteforce attempts,
+    # credential templates, etc.) to actually run. The system prompt now
+    # forbids DeepSeek from using bash/sh/shell/zsh fences at all — real
+    # execution must go through <tool_use>, and illustrative commands must use
+    # inline backticks or a non-shell fence tag instead — so a ```bash fence
+    # reaching this point is always left as inert display text.
 
     print(
         f"[parsed blocks] {[b['type'] + ('/' + b.get('name','')) if b['type'] == 'tool_use' else b['type'] for b in blocks]}",
