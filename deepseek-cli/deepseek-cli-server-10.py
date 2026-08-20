@@ -1118,6 +1118,65 @@ def _find_first_tool_call_end(text: str) -> int:
     return min(candidates) if candidates else -1
 
 
+def _fix_missing_opening_tool_use_tag(text: str) -> str:
+    """
+    Repair a reply that contains one or more literal </tool_use> closing
+    tags but NO opening <tool_use> tag anywhere — e.g.:
+
+        </tool_use>
+        {"name": "Bash", "input": {...}}
+        </tool_use>
+
+    or simply:
+
+        {"name": "Bash", "input": {...}}
+        </tool_use>
+
+    The main scan in parse_response requires a literal opening tag to match
+    anything at all, so without this repair a reply shaped like this never
+    matches and the whole thing — including a genuine, parseable tool call —
+    falls through as inert text.
+
+    Conservative by construction: only rewrites when (a) no real opening tag
+    exists anywhere in the text, and (b) the JSON sitting immediately before
+    the last closing tag actually parses as a tool-call object with a
+    "name" key. Anything else is left untouched rather than guessed at.
+    """
+    if "<tool_use>" in text:
+        return text  # a real opening tag exists — not this case
+
+    closes = list(re.finditer(r"</tool_use>", text))
+    if not closes:
+        return text
+
+    # The real payload sits before the LAST closing tag — that's DeepSeek's
+    # actual intended close. Anything before an earlier closing tag (a
+    # stray/hallucinated one) is discarded, mirroring what a genuine
+    # <tool_use>...</tool_use> block would keep (just its own inner text).
+    last_close = closes[-1]
+    head = text[:last_close.start()]
+    tail = text[last_close.end():]
+
+    search_from = closes[-2].end() if len(closes) > 1 else 0
+    brace_idx = head.find("{", search_from)
+    if brace_idx == -1:
+        return text  # no JSON-looking payload here — leave untouched
+
+    prose = head[:brace_idx]
+    json_candidate = head[brace_idx:].strip()
+    obj = _parse_json_tool(json_candidate)
+    if not isinstance(obj, dict) or "name" not in obj:
+        return text  # doesn't parse as a tool call — leave untouched
+
+    print(
+        f"[tool_parse] repaired reply missing opening <tool_use> tag "
+        f"({len(closes)} closing tag(s) found, 0 opening): "
+        f"{repr(json_candidate[:80])}",
+        flush=True,
+    )
+    return f"{prose}<tool_use>\n{json_candidate}\n</tool_use>{tail}"
+
+
 def parse_response(text: str, valid_tools: set[str] | None = None) -> list:
     """
     Parse DeepSeek reply into Anthropic content blocks.
@@ -1203,13 +1262,34 @@ def parse_response(text: str, valid_tools: set[str] | None = None) -> list:
     # Strip the outer begin/end wrappers if any remain
     text = re.sub(r"<｜tool▁calls▁begin｜>|<｜tool▁calls▁end｜>", "", text)
 
-    # ── Pre-pass 3: strip hallucinated conversation continuations ────────────
+    # ── Pre-pass 3: repair a missing opening <tool_use> tag ──────────────────
+    # Mirror image of the duplicated-OPENING-tag repairs in _parse_json_tool
+    # (m_dup/m_lit) — those fire once the main scan below has already matched
+    # an opening tag. This handles the opposite shape: DeepSeek sometimes
+    # emits a well-formed tool call with NO opening tag at all, e.g.:
+    #   </tool_use>
+    #   {"name": "Bash", "input": {...}}
+    #   </tool_use>
+    # (a stray leading close, then the real call, then its real close) or
+    # just:
+    #   {"name": "Bash", "input": {...}}
+    #   </tool_use>
+    # Without this repair, the main scan's regex requires a literal opening
+    # tag to match anything at all, so text like this never matches ANYWHERE
+    # and the entire reply — including a perfectly valid tool call — falls
+    # through as inert text. Only fires when there's no real opening tag
+    # anywhere in the reply; if one exists, this is not that case and the
+    # normal scan (plus the duplicated-open-tag repairs) handles it.
+    text = _fix_missing_opening_tool_use_tag(text)
+
+    # ── Pre-pass 4: strip hallucinated conversation continuations ────────────
     # DeepSeek sometimes emits a real tool call, then keeps going by
     # fabricating "Human: <tool_result>..." / "Assistant: ..." turns of its
     # own — worst case, a SECOND tool call based on a result it made up.
-    # Runs AFTER Pre-passes 1-2 so every real tool-call format (<tool_use>,
-    # the <tool_call name="X"> alias, and the special-token format) has
-    # already been normalized to <tool_use> by this point.
+    # Runs AFTER Pre-passes 1-3 so every real tool-call format (<tool_use>,
+    # the <tool_call name="X"> alias, the special-token format, and a
+    # missing-opening-tag reply) has already been normalized to <tool_use>
+    # by this point.
     #
     # The two protocol-specific markers below are safe to strip unconditionally
     # — nobody writes literal "<tool_result>"/"<tool_use_error>" tags in normal
@@ -1782,9 +1862,18 @@ def call_deepseek(session: dict, prompt: str, parent_message_id: int | None) -> 
             if isinstance(v, dict) and "response" in v:
                 resp_obj = v["response"]
                 new_msg_id = resp_obj.get("message_id")
-                for f in resp_obj.get("fragments", []):
-                    if f.get("type") == "RESPONSE":
-                        chunk = f.get("content", "")
+                # Join ALL RESPONSE-type fragments in order — this snapshot
+                # can arrive with more than one already-buffered fragment
+                # (e.g. on reconnect), and keeping only the last one (the
+                # previous behaviour) silently dropped the earlier content,
+                # which could chop the front off an otherwise well-formed
+                # tool call (e.g. losing a leading "<tool_use>" open tag).
+                parts = [
+                    f.get("content", "") for f in resp_obj.get("fragments", [])
+                    if f.get("type") == "RESPONSE"
+                ]
+                if parts:
+                    chunk = "".join(parts)
             elif isinstance(v, str) and o == "APPEND" and p == "response/fragments/-1/content":
                 chunk = v
             elif isinstance(v, str) and "p" not in pl:
