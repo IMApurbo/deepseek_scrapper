@@ -701,7 +701,39 @@ def _parse_json_tool(raw: str) -> dict | None:
         return obj
     except json.JSONDecodeError:
         pass
-    
+
+    # Attempt 1b: unwrap a duplicated <tool_use> open tag. DeepSeek sometimes
+    # emits a SECOND literal "<tool_use>" as the value of "name" instead of
+    # just writing the inner call directly, e.g.:
+    #   {"name": "<tool_use>
+    #   {"name": "Bash", "input": {...}}
+    # Only one closing </tool_use> ever follows, so parse_response's
+    # non-greedy match captures both layers as one blob — the outer "name"
+    # string is unterminated, so a straight parse fails outright and none of
+    # the repairs below (trailing commas / unclosed braces / missing outer
+    # braces) apply, since this isn't truncated or malformed JSON, it's a
+    # duplicated wrapper around otherwise-valid JSON. Strip the corrupt
+    # prefix and parse what's actually the real inner call.
+    m_dup = re.match(r'^\{\s*"name"\s*:\s*"<tool_use>\s*', cleaned)
+    if m_dup:
+        obj = _parse_json_tool(cleaned[m_dup.end():])
+        if obj is not None:
+            print(f"[tool_parse] unwrapped duplicated <tool_use> open tag: {repr(cleaned[:80])}", flush=True)
+            return obj
+
+    # Attempt 1c: same duplication, but written as a literal second opening
+    # tag rather than embedded inside the JSON string value, e.g.:
+    #   <tool_use><tool_use>{"name": "Bash", "input": {...}}</tool_use></tool_use>
+    # The outer scan's non-greedy match stops at the FIRST </tool_use>, so
+    # what reaches here is a dangling leading "<tool_use>" in front of
+    # otherwise-valid JSON — strip it and parse what's left.
+    m_lit = re.match(r'^<tool_use>\s*', cleaned)
+    if m_lit:
+        obj = _parse_json_tool(cleaned[m_lit.end():])
+        if obj is not None:
+            print(f"[tool_parse] stripped literal duplicated <tool_use> open tag: {repr(cleaned[:80])}", flush=True)
+            return obj
+
     # Attempt 2: Remove trailing commas
     try:
         fixed = re.sub(r",\s*([}\]])", r"\1", cleaned)
