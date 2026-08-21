@@ -685,6 +685,61 @@ def _strip_json_fences(raw: str) -> str:
     return raw
 
 
+# Valid single-character JSON escape letters (after the leading backslash).
+# JSON spec §7: only these are legal after a backslash inside a string.
+_VALID_JSON_ESC_CHARS = frozenset({'"', '\\', '/', 'b', 'f', 'n', 'r', 't'})
+
+
+def _fix_invalid_json_escapes(s: str) -> str:
+    """
+    Replace invalid JSON escape sequences in a raw JSON string with
+    valid equivalents so json.loads can parse it.
+
+    JSON only allows: \\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX
+    DeepSeek embeds Python code in JSON strings that may contain Python-style
+    escapes such as \\x00, \\a, \\v, \\0, or \\' — all illegal in JSON.
+
+    Conversion rules (applied at the raw-text level, not per parsed value):
+      \\xNN  →  \\u00NN   hex escape  → JSON unicode escape (value preserved)
+      \\uXXXX             already valid, left untouched
+      any other \\<c>    →  \\\\<c>  escape the backslash, emit <c> literally
+
+    This function is a no-op when the input contains no invalid escapes, so
+    it is safe to call eagerly on all inputs.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch != '\\' or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        nxt = s[i + 1]
+        if nxt in _VALID_JSON_ESC_CHARS:
+            # Valid single-char escape — keep as-is
+            out.append(ch)
+            out.append(nxt)
+            i += 2
+        elif nxt == 'u' and i + 5 <= n and all(
+                c in '0123456789abcdefABCDEF' for c in s[i + 2: i + 6]):
+            # Valid \uXXXX — keep as-is
+            out.append(s[i: i + 6])
+            i += 6
+        elif nxt == 'x' and i + 3 < n and all(
+                c in '0123456789abcdefABCDEF' for c in s[i + 2: i + 4]):
+            # \xNN → \u00NN  (Python hex-escape → JSON unicode escape)
+            out.append(f'\\u00{s[i + 2: i + 4]}')
+            i += 4
+        else:
+            # Invalid escape (\a \v \0 \' etc.) — escape the backslash.
+            # The offending character is emitted normally on the next iteration.
+            out.append('\\\\')
+            i += 1
+    return ''.join(out)
+
+
 def _parse_json_tool(raw: str) -> dict | None:
     """
     Try to parse a JSON tool-use block. Handles:
@@ -694,7 +749,19 @@ def _parse_json_tool(raw: str) -> dict | None:
     Returns a tool_use block dict or None on failure.
     """
     cleaned = _strip_json_fences(raw)
-    
+    _original_cleaned = cleaned  # kept for the failure log at the bottom
+
+    # Pre-pass: fix invalid JSON escape sequences before any parse attempt.
+    # DeepSeek embeds Python code in JSON strings, and Python uses \x00, \a,
+    # \v, \' etc. which are not legal JSON escapes — json.loads raises
+    # "Invalid \escape" and every repair attempt below also fails.
+    # _fix_invalid_json_escapes is a no-op on already-valid JSON so applying
+    # it eagerly here is safe; all subsequent attempts use the cleaned form.
+    _escape_fixed = _fix_invalid_json_escapes(cleaned)
+    if _escape_fixed != cleaned:
+        print("[tool_parse] pre-fixed invalid JSON escape sequences", flush=True)
+        cleaned = _escape_fixed
+
     # Attempt 1: straight parse
     try:
         obj = json.loads(cleaned)
@@ -778,7 +845,7 @@ def _parse_json_tool(raw: str) -> dict | None:
     except json.JSONDecodeError:
         pass
     
-    print(f"[tool_parse] failed to parse JSON: {repr(cleaned[:120])}", flush=True)
+    print(f"[tool_parse] failed to parse JSON: {repr(_original_cleaned[:120])}", flush=True)
     return None
 
 
