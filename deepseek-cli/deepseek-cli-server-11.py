@@ -1144,119 +1144,10 @@ def strip_premature_exit_preambles(text: str) -> str:
     return text
 
 
-# Broader than the preamble-stripping patterns above — these don't require a
-# tool call to follow. Used to detect the "announced an action but never
-# executed it" failure mode so call_with_filter can force a retry instead of
-# silently returning the announcement as a finished answer.
-#
-# This used to be a WHITELIST of action verbs (check/run/execute/...), but
-# that's a losing game — there's no way to enumerate every verb a model might
-# use to describe an action ("explore" was missed and shipped a real bug).
-# Flipped to a BLACKLIST instead: match any "let me/I'll/..." + verb, and
-# only exclude the small set of verbs that are genuinely just conversational
-# filler regardless of context (e.g. "Let me know if you need anything
-# else."). Combined with the trailing-length check below (the real precision
-# mechanism — see looks_like_unexecuted_intent), this stays robust against
-# verbs nobody thought to list ahead of time.
-_INTENT_PREFIX_PATTERN = re.compile(
-    r"\b(?:let me|let's|i'll|i will|i'm going to|i am going to|"
-    r"i'm about to|i am about to|first,?\s+i'll|first,?\s+let me|"
-    r"now\s+i'll|now\s+let me)\s+(\w+)",
-    re.IGNORECASE,
-)
-
-_BENIGN_INTENT_VERBS = {
-    "know", "help", "clarify", "explain", "elaborate", "answer", "assist",
-    "summarize", "summarise", "think", "recap", "reiterate", "rephrase",
-    "add", "note", "mention", "say", "put", "phrase", "walk",
-    # Generic verbs that show up constantly in ordinary explanatory prose
-    # unrelated to any tool action (e.g. "let me use a simple example",
-    # "let me try a different way of putting it") — excluded for the same
-    # reason as the original whitelist-based fix.
-    "use", "open", "call", "list", "try", "consider", "imagine", "suppose",
-}
 
 
-def looks_like_unexecuted_intent(text: str) -> bool:
-    """True if the reply reads as an announcement of an action rather than
-    the action itself — the exact pattern that should never reach the user
-    as a finished, tool-less answer.
-
-    Requires the match to be near the END of the reply with little or
-    nothing after it — that's the actual shape of the failure ("Let me
-    check the config file." and then nothing). A phrase like "let me check"
-    appearing mid-way through an otherwise complete, substantive answer
-    (e.g. "let me check my understanding: <500 words of real answer>") is
-    almost always conversational filler, not a stalled action — flagging
-    that would just force a needless retry on a perfectly good response.
-    """
-    stripped = text.strip()
-    if not stripped:
-        return False
-    TRAILING_SLACK = 120
-    for m in _INTENT_PREFIX_PATTERN.finditer(stripped):
-        verb = m.group(1).lower()
-        if verb in _BENIGN_INTENT_VERBS:
-            continue
-        if len(stripped) - m.end() < TRAILING_SLACK:
-            return True
-    return False
 
 
-# Confident claims of a completed/verified action ("I checked...", "tests
-# pass", "fixed it") with no tool call anywhere in the reply to back them up.
-# Unlike _INTENT_PREFIX_PATTERN (forward-looking "let me..." stalls), this
-# catches the opposite and more dangerous shape: the model asserting
-# something is already true instead of admitting it hasn't looked yet.
-_FABRICATED_COMPLETION_PATTERN = re.compile(
-    r"\bi(?:'ve|'m| have| am)?\s+(?:already\s+)?"
-    r"(?:checked|verified|confirmed|tested|ran|run|reviewed|examined|inspected|"
-    r"fixed|updated|completed|validated)\b"
-    r"|\b(?:tests?|checks?|build)\s+(?:all\s+)?(?:passed?|succeeded?)\b"
-    r"|\ball\s+(?:tests?|checks?)\s+(?:pass|passed|succeeded)\b",
-    re.IGNORECASE,
-)
-
-# Words in the ~30 chars BEFORE a match that flip it from "asserting this
-# already happened" to "talking about a future/hypothetical/advisory case"
-# — "once I have run the tests", "should check whether tests pass", etc.
-# are not completion claims even though the trigger words appear in them.
-_COMPLETION_CLAIM_DISQUALIFIERS = re.compile(
-    r"\b(?:once|if|when|whether|unless|before|until|after|should|would|could|"
-    r"might|may|will|going\s+to|let'?s|let\s+me|i'll|need\s+to|have\s+to|"
-    r"make\s+sure|ensure|so\s+that|in\s+order\s+to|assuming)\b",
-    re.IGNORECASE,
-)
-_DISQUALIFIER_CONTEXT_CHARS = 30
-
-
-def looks_like_fabricated_completion_claim(text: str) -> bool:
-    """True if the reply confidently claims a verified/completed action with
-    no tool call anywhere in it to have actually produced that verification.
-
-    Deliberately scoped to ONLY be called by ToolFilter when nothing in this
-    conversation has ever used a tool yet (see ToolFilter._has_prior_tool_activity)
-    — at that point in a session literally nothing could have been checked,
-    run, or fixed for real, so any such claim is unambiguously fabricated.
-    Applying this on later turns too would risk false-positiving on a reply
-    that legitimately recaps a real result from earlier in the conversation
-    ("as I found earlier, the tests passed") — this function has no visibility
-    into conversation history to tell those apart, so the caller must gate it.
-
-    Each candidate match is checked against its preceding context: a
-    forward-looking/conditional lead-in ("once I have run the tests",
-    "should check whether tests pass") disqualifies that match instead of
-    being treated as a claim — those are hypotheticals, not fabrications.
-    """
-    stripped = text.strip()
-    if not stripped:
-        return False
-    for m in _FABRICATED_COMPLETION_PATTERN.finditer(stripped):
-        context = stripped[max(0, m.start() - _DISQUALIFIER_CONTEXT_CHARS):m.start()]
-        if _COMPLETION_CLAIM_DISQUALIFIERS.search(context):
-            continue
-        return True
-    return False
 
 
 def strip_fabricated_continuation(text: str) -> str:
@@ -1855,150 +1746,8 @@ def _find_unknown_tools(raw_text: str, valid_tools: set[str]) -> set[str]:
     return unknown
 
 
-# The prefill this whole proxy already depends on: build_prompt ends every
-# prompt with a bare "Assistant:" and DeepSeek continues from there — that's
-# the only reason the flattened Human:/Assistant: text produces turn-shaped
-# replies at all. On a RETRY where we already have strong evidence a tool
-# call is wanted (looks_like_unexecuted_intent fired, or the model tried an
-# unknown tool name), we can extend that same cue past "Assistant:" into an
-# already-opened tool_use/JSON block: "Assistant: <tool_use>\n{\"name\": \"".
-# A prose sentence can't naturally continue from an open '{' — the
-# continuation is now syntactically committed to JSON, not prose. This is
-# strictly better than just asking nicely, and safe here specifically
-# because we only apply it once we already know a tool call is what's
-# needed — applying it on the FIRST/default attempt would wrongly force a
-# tool call on turns that legitimately don't need one.
+# Prefill used only by the unknown-tool retry (Case 1 in call_with_filter).
 _TOOL_USE_PREFILL = '<tool_use>\n{"name": "'
-
-# Escape-hatch sentinel: the forced prefill above structurally commits the
-# retry continuation to *some* JSON tool call — there is no way for DeepSeek
-# to back out into plain prose once "Assistant: <tool_use>\n{\"name\": \" is
-# already on the wire, since whatever it writes next just becomes the value
-# of "name". Without an escape hatch, a genuinely correct decision ("no tool
-# is needed here, I can just answer") gets forced into that string anyway,
-# producing garbage like {"name": "I apologize for the error. Let me
-# directly answer..."} that fails every JSON repair attempt — a real,
-# valid answer gets mangled into a parse failure. This sentinel name gives
-# the model a syntactically valid way to finish the already-open JSON while
-# still landing on "just answer in text", so a legitimately tool-less reply
-# survives the retry instead of being corrupted by it.
-_NO_TOOL_SENTINEL = "no_tool_needed"
-
-
-def _extract_no_tool_response(raw_text: str) -> str | None:
-    """
-    Look for the {"name": "no_tool_needed", "input": {"response": "..."}}
-    escape hatch anywhere in raw_text and return its response string, or
-    None if the sentinel isn't present.
-
-    Checked directly against raw_text rather than going through the normal
-    parse_response/valid_tools pipeline: "no_tool_needed" is deliberately
-    never a member of self._valid_tools (it isn't a real tool Claude Code
-    offered), so routing it through that pipeline would just make
-    _find_unknown_tools flag it as an unknown tool and fire ANOTHER retry
-    loop — fighting the very retry that produced it. Handling it as a
-    special case up front lets it end the retry loop cleanly instead.
-    """
-    m = re.search(
-        r'<tool_use>\s*(?P<json>\{.*?"name"\s*:\s*"' + re.escape(_NO_TOOL_SENTINEL) + r'".*?\})\s*</tool_use>',
-        raw_text, re.DOTALL,
-    )
-    if not m:
-        # Truncated shape: the forced prefill opens <tool_use>\n{"name": "
-        # and generation may stop before a closing </tool_use> is ever
-        # emitted — match to the end of the text in that case.
-        m = re.search(
-            r'<tool_use>\s*(?P<json>\{.*"name"\s*:\s*"' + re.escape(_NO_TOOL_SENTINEL) + r'".*)',
-            raw_text, re.DOTALL,
-        )
-        if not m:
-            return None
-    obj = _parse_json_tool(m.group("json"))
-    if not isinstance(obj, dict):
-        return None
-    input_obj = obj.get("input")
-    resp = input_obj.get("response") if isinstance(input_obj, dict) else None
-    if not resp or not isinstance(resp, str):
-        return None
-    return resp
-
-
-def _no_action_correction(attempt: int, fabricated_claim: bool = False) -> tuple[str, str]:
-    """
-    Escalating correction text for the "no tool_use block" retry, combined
-    with assistant-turn prefill (see _TOOL_USE_PREFILL above). Wording alone
-    wasn't reliable enough even with retries — this makes stalling
-    syntactically hard, not just against the rules.
-
-    Two distinct violations land here (see ToolFilter.call_with_filter Case
-    2) and need different wording, not just a different log line — telling
-    the model "you described an action" when it actually fabricated a
-    completed/verified claim describes the wrong mistake and is a weaker
-    correction:
-      - fabricated_claim=False: announced an action ("Let me check...") and
-        then stopped instead of executing it.
-      - fabricated_claim=True:  asserted something was already checked/
-        verified/fixed with no tool call anywhere to back it up.
-
-    Returns (prompt_suffix, prefill). Caller must prepend `prefill` back
-    onto whatever DeepSeek returns before parsing — DeepSeek only returns
-    the continuation, not an echo of what we already committed to.
-    """
-    if fabricated_claim:
-        if attempt == 1:
-            body = (
-                "You claimed something was already checked, verified, tested, or\n"
-                "fixed, but no tool was ever called in this conversation to actually\n"
-                "establish that. That claim is fabricated — you have not looked yet."
-            )
-        elif attempt < 4:
-            body = (
-                f"STOP. You are STILL asserting a result you have not actually\n"
-                f"obtained via a real tool call. This is attempt {attempt}."
-            )
-        else:
-            body = (
-                f"FINAL WARNING — attempt {attempt}. Your last {attempt - 1} replies were\n"
-                f"ALL fabricated claims with no real tool call behind them."
-            )
-    else:
-        if attempt == 1:
-            body = (
-                "You described an action but did not output a <tool_use> block.\n"
-                "Do not describe what you are about to do."
-            )
-        elif attempt < 4:
-            body = (
-                f"STOP. You are STILL writing a sentence about what you're going to do\n"
-                f"instead of doing it. This is attempt {attempt}."
-            )
-        else:
-            body = (
-                f"FINAL WARNING — attempt {attempt}. Your last {attempt - 1} replies were\n"
-                f"ALL just sentences with no tool call. That is a failure every time."
-            )
-    if fabricated_claim:
-        instruction = (
-            f"The tag below is already open — continue directly from it with the "
-            f"real tool name and input, then close it. Do not write anything else."
-        )
-    else:
-        instruction = (
-            f"The tag below is already open. If a tool call really is needed, continue\n"
-            f"directly from it with the real tool name and input, then close it.\n"
-            f"If, on reflection, NO tool is actually needed and you can just answer\n"
-            f"directly, instead complete the open JSON as exactly:\n"
-            f'{_NO_TOOL_SENTINEL}", "input": {{"response": "<your full answer text here>"}}}}\n'
-            f"then close the tag with </tool_use> — i.e. finish with tool name "
-            f'"{_NO_TOOL_SENTINEL}" and put your entire answer in input.response.\n'
-            f"Either way, do not write anything else."
-        )
-    suffix = (
-        f"\n\nHuman: <tool_use_error>\n{body}\n"
-        f"{instruction}\n"
-        f"</tool_use_error>\n\nAssistant: {_TOOL_USE_PREFILL}"
-    )
-    return suffix, _TOOL_USE_PREFILL
 
 
 # ── ToolFilter ────────────────────────────────────────────────────────────────
@@ -2026,52 +1775,18 @@ class ToolFilter:
             name = t.get("name")
             if name:
                 self._valid_tools.add(name)
-        # Whether the caller (Claude Code) actually offered tools this turn.
-        # Only meaningful for deciding whether "no tool_use block" is suspicious.
-        self._tools_offered = bool(tools)
-        # True if this conversation has NEVER used a tool yet (no tool_use /
-        # tool_result block anywhere in prior history). Used to safely gate
-        # looks_like_fabricated_completion_claim — on a truly fresh
-        # conversation nothing could have been checked/run/fixed for real
-        # yet, so such a claim is unambiguous. On later turns a claim like
-        # "as I found earlier, the tests passed" can be legitimately true,
-        # and this class has no way to tell those apart, so the check must
-        # not run there.
-        self._has_prior_tool_activity = any(
-            isinstance(m.get("content"), list)
-            and any(
-                isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
-                for b in m["content"]
-            )
-            for m in (messages or [])
-        )
 
     def call_with_filter(self, session_key: str, prompt: str) -> tuple[str, list]:
         """
         Returns (raw_text, blocks).
 
-        Retries when either:
-          1. The model calls an unknown tool name — inject the valid tool
-             list and ask it to retry. Budget: MAX_UNKNOWN_TOOL_RETRIES.
-          2. The model's reply reads as an announcement of an action
-             ("Let me check...", "I'll explore...") but contains no
-             tool_use block at all. This is the dominant observed failure
-             mode, so it gets a much bigger budget (MAX_NO_ACTION_RETRIES)
-             and the correction wording escalates each attempt.
-
-        Both retry paths use assistant-turn prefill (_TOOL_USE_PREFILL): once
-        we already know a tool call is wanted (that's exactly what triggered
-        the retry), the retry prompt ends already inside an opened
-        <tool_use>{"name": " block instead of a bare "Assistant:" cue —
-        structurally ruling out another prose stall, not just asking nicely
-        again. Since DeepSeek only returns the continuation (not an echo of
-        what we fed it), the prefill has to be manually stitched back onto
-        the front of whatever comes back before it's parsed.
+        Retries only when the model calls an unknown tool name — injects the
+        valid tool list and asks it to retry with a prefill. Budget:
+        MAX_UNKNOWN_TOOL_RETRIES. The model is otherwise free to respond with
+        or without a tool call as it sees fit.
         """
         MAX_UNKNOWN_TOOL_RETRIES = 2
-        MAX_NO_ACTION_RETRIES = 5
         unknown_tool_attempts = 0
-        no_action_attempts = 0
         current_prompt = prompt
         pending_prefill = ""
         raw_text, blocks = "", []
@@ -2082,23 +1797,9 @@ class ToolFilter:
                 raw_text = pending_prefill + raw_text
                 pending_prefill = ""
 
-            # ── Case 0: model used the no_tool_needed escape hatch ────────
-            # Checked BEFORE parse_response/unknown-tool detection: the
-            # sentinel name is deliberately not in self._valid_tools (it
-            # isn't a real Claude Code tool), so letting it fall through to
-            # the normal pipeline would make Case 1 below flag it as an
-            # unknown tool and fire a retry loop that fights this one. A
-            # legitimate "no tool needed" answer ends the retry loop here,
-            # as plain text, instead of being forced through more retries.
-            no_tool_text = _extract_no_tool_response(raw_text)
-            if no_tool_text is not None:
-                print("[tool_parse] model used no_tool_needed escape hatch — "
-                      "returning as plain text", flush=True)
-                return no_tool_text, [{"type": "text", "text": no_tool_text}]
-
             blocks = parse_response(raw_text, valid_tools=self._valid_tools)
 
-            # ── Case 1: unknown tool name ────────────────────────────────
+            # ── Unknown tool name: retry with valid tool list ─────────────
             unknown = _find_unknown_tools(raw_text, self._valid_tools)
             if unknown:
                 if unknown_tool_attempts >= MAX_UNKNOWN_TOOL_RETRIES:
@@ -2129,41 +1830,6 @@ class ToolFilter:
                 pending_prefill = _TOOL_USE_PREFILL
                 continue
 
-            # ── Case 2: announced an action but never executed it, OR
-            # claimed a completed/verified action that never happened ─────
-            has_tool_use = any(b["type"] == "tool_use" for b in blocks)
-            stalled_intent = looks_like_unexecuted_intent(raw_text)
-            # Only checked on a conversation that has NEVER used a tool yet —
-            # see looks_like_fabricated_completion_claim's docstring for why
-            # this can't safely run on later turns.
-            fabricated_claim = (
-                not self._has_prior_tool_activity
-                and looks_like_fabricated_completion_claim(raw_text)
-            )
-            if not has_tool_use and self._tools_offered and (stalled_intent or fabricated_claim):
-                if no_action_attempts >= MAX_NO_ACTION_RETRIES:
-                    print(
-                        "[tool_parse] response still announces/claims action without a "
-                        f"tool_use block after {MAX_NO_ACTION_RETRIES} retries — "
-                        "returning as-is",
-                        flush=True,
-                    )
-                    return raw_text, blocks
-
-                no_action_attempts += 1
-                is_fabricated_claim = fabricated_claim and not stalled_intent
-                reason = "fabricated completion claim" if is_fabricated_claim else "announced action with no tool_use block"
-                print(
-                    f"[tool_parse] response has {reason} — "
-                    f"forcing retry with prefill (attempt {no_action_attempts}/{MAX_NO_ACTION_RETRIES})",
-                    flush=True,
-                )
-                suffix, prefill = _no_action_correction(no_action_attempts, fabricated_claim=is_fabricated_claim)
-                current_prompt = current_prompt + suffix
-                pending_prefill = prefill
-                continue
-
-            # All good.
             return raw_text, blocks
 
 
