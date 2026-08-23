@@ -1870,6 +1870,58 @@ def _find_unknown_tools(raw_text: str, valid_tools: set[str]) -> set[str]:
 # tool call on turns that legitimately don't need one.
 _TOOL_USE_PREFILL = '<tool_use>\n{"name": "'
 
+# Escape-hatch sentinel: the forced prefill above structurally commits the
+# retry continuation to *some* JSON tool call — there is no way for DeepSeek
+# to back out into plain prose once "Assistant: <tool_use>\n{\"name\": \" is
+# already on the wire, since whatever it writes next just becomes the value
+# of "name". Without an escape hatch, a genuinely correct decision ("no tool
+# is needed here, I can just answer") gets forced into that string anyway,
+# producing garbage like {"name": "I apologize for the error. Let me
+# directly answer..."} that fails every JSON repair attempt — a real,
+# valid answer gets mangled into a parse failure. This sentinel name gives
+# the model a syntactically valid way to finish the already-open JSON while
+# still landing on "just answer in text", so a legitimately tool-less reply
+# survives the retry instead of being corrupted by it.
+_NO_TOOL_SENTINEL = "no_tool_needed"
+
+
+def _extract_no_tool_response(raw_text: str) -> str | None:
+    """
+    Look for the {"name": "no_tool_needed", "input": {"response": "..."}}
+    escape hatch anywhere in raw_text and return its response string, or
+    None if the sentinel isn't present.
+
+    Checked directly against raw_text rather than going through the normal
+    parse_response/valid_tools pipeline: "no_tool_needed" is deliberately
+    never a member of self._valid_tools (it isn't a real tool Claude Code
+    offered), so routing it through that pipeline would just make
+    _find_unknown_tools flag it as an unknown tool and fire ANOTHER retry
+    loop — fighting the very retry that produced it. Handling it as a
+    special case up front lets it end the retry loop cleanly instead.
+    """
+    m = re.search(
+        r'<tool_use>\s*(?P<json>\{.*?"name"\s*:\s*"' + re.escape(_NO_TOOL_SENTINEL) + r'".*?\})\s*</tool_use>',
+        raw_text, re.DOTALL,
+    )
+    if not m:
+        # Truncated shape: the forced prefill opens <tool_use>\n{"name": "
+        # and generation may stop before a closing </tool_use> is ever
+        # emitted — match to the end of the text in that case.
+        m = re.search(
+            r'<tool_use>\s*(?P<json>\{.*"name"\s*:\s*"' + re.escape(_NO_TOOL_SENTINEL) + r'".*)',
+            raw_text, re.DOTALL,
+        )
+        if not m:
+            return None
+    obj = _parse_json_tool(m.group("json"))
+    if not isinstance(obj, dict):
+        return None
+    input_obj = obj.get("input")
+    resp = input_obj.get("response") if isinstance(input_obj, dict) else None
+    if not resp or not isinstance(resp, str):
+        return None
+    return resp
+
 
 def _no_action_correction(attempt: int, fabricated_claim: bool = False) -> tuple[str, str]:
     """
@@ -1925,10 +1977,25 @@ def _no_action_correction(attempt: int, fabricated_claim: bool = False) -> tuple
                 f"FINAL WARNING — attempt {attempt}. Your last {attempt - 1} replies were\n"
                 f"ALL just sentences with no tool call. That is a failure every time."
             )
+    if fabricated_claim:
+        instruction = (
+            f"The tag below is already open — continue directly from it with the "
+            f"real tool name and input, then close it. Do not write anything else."
+        )
+    else:
+        instruction = (
+            f"The tag below is already open. If a tool call really is needed, continue\n"
+            f"directly from it with the real tool name and input, then close it.\n"
+            f"If, on reflection, NO tool is actually needed and you can just answer\n"
+            f"directly, instead complete the open JSON as exactly:\n"
+            f'{_NO_TOOL_SENTINEL}", "input": {{"response": "<your full answer text here>"}}}}\n'
+            f"then close the tag with </tool_use> — i.e. finish with tool name "
+            f'"{_NO_TOOL_SENTINEL}" and put your entire answer in input.response.\n'
+            f"Either way, do not write anything else."
+        )
     suffix = (
         f"\n\nHuman: <tool_use_error>\n{body}\n"
-        f"The tag below is already open — continue directly from it with the "
-        f"real tool name and input, then close it. Do not write anything else.\n"
+        f"{instruction}\n"
         f"</tool_use_error>\n\nAssistant: {_TOOL_USE_PREFILL}"
     )
     return suffix, _TOOL_USE_PREFILL
@@ -2014,6 +2081,21 @@ class ToolFilter:
             if pending_prefill:
                 raw_text = pending_prefill + raw_text
                 pending_prefill = ""
+
+            # ── Case 0: model used the no_tool_needed escape hatch ────────
+            # Checked BEFORE parse_response/unknown-tool detection: the
+            # sentinel name is deliberately not in self._valid_tools (it
+            # isn't a real Claude Code tool), so letting it fall through to
+            # the normal pipeline would make Case 1 below flag it as an
+            # unknown tool and fire a retry loop that fights this one. A
+            # legitimate "no tool needed" answer ends the retry loop here,
+            # as plain text, instead of being forced through more retries.
+            no_tool_text = _extract_no_tool_response(raw_text)
+            if no_tool_text is not None:
+                print("[tool_parse] model used no_tool_needed escape hatch — "
+                      "returning as plain text", flush=True)
+                return no_tool_text, [{"type": "text", "text": no_tool_text}]
+
             blocks = parse_response(raw_text, valid_tools=self._valid_tools)
 
             # ── Case 1: unknown tool name ────────────────────────────────
