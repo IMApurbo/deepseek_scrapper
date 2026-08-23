@@ -3,10 +3,8 @@
 DeepSeek → Anthropic API Proxy
 Exposes /v1/messages that Claude Code can talk to, forwarding to DeepSeek.
 
-- Translates Anthropic tool definitions → XML schema in the prompt
-- Parses DeepSeek plain-text responses for <tool_use> blocks
-- Re-emits proper Anthropic tool_use / text content blocks
-- Handles tool_result turns in conversation history
+- Passes user input directly to DeepSeek, no tool injection or parsing
+- Returns DeepSeek's plain-text response as a text content block
 - Memory-efficient: root-pins after first reply (history stays at 2 msgs)
 
 Requirements:
@@ -347,43 +345,12 @@ def derive_session_key(system: str, msgs: list) -> str:
     basis = f"{system[:2000]}\n---\n{first_user_text[:2000]}"
     return hashlib.sha256(basis.encode("utf-8", "ignore")).hexdigest()[:16]
 
-# ── Tool schema → prompt helpers ──────────────────────────────────────────────
-
-def tools_to_xml(tools: list) -> str:
-    """Render Anthropic tool definitions as XML so DeepSeek understands them."""
-    if not tools:
-        return ""
-    lines = ["<tools>"]
-    for t in tools:
-        name = t.get("name", "")
-        desc = t.get("description", "")
-        schema = t.get("input_schema", {})
-        props = schema.get("properties", {})
-        required = schema.get("required", [])
-        lines.append(f"  <tool>")
-        lines.append(f"    <name>{name}</name>")
-        lines.append(f"    <description>{desc}</description>")
-        if props:
-            lines.append(f"    <parameters>")
-            for pname, pdef in props.items():
-                req = " required=\"true\"" if pname in required else ""
-                ptype = pdef.get("type", "string")
-                pdesc = pdef.get("description", "")
-                lines.append(f"      <parameter name=\"{pname}\" type=\"{ptype}\"{req}>{pdesc}</parameter>")
-            lines.append(f"    </parameters>")
-        lines.append(f"  </tool>")
-    lines.append("</tools>")
-    return "\n".join(lines)
-
-
 def _bound_messages(messages: list) -> list:
     """
     Cap how many turns of a conversation get flattened into the prompt.
     Keeps the first message (original task framing) plus the most recent
     MAX_HISTORY_MESSAGES-1 turns, dropping the middle. Without this, a long
-    multi-step session grows the prompt without bound and the tool-call
-    instructions at the top get diluted by the time the model reaches the
-    end of it.
+    multi-step session grows the prompt without bound.
     """
     if len(messages) <= MAX_HISTORY_MESSAGES:
         return messages
@@ -404,48 +371,29 @@ def build_prompt(system: str, messages: list, tools: list) -> str:
     """
     Build a single prompt string from the full conversation history.
 
-    This script no longer injects any instructional/system text of its own
-    (no tool-calling rules, no reminders, no corrections) — `system`, the
-    tool schema, and every message are passed through exactly as given by
-    the caller. The only thing added here is the Human:/Assistant: turn
-    formatting needed to flatten a multi-turn conversation into one prompt
-    string.
+    Tools are ignored entirely — no schema is injected, no tool_result or
+    tool_use blocks are formatted. Only plain text content from user and
+    assistant turns is included. DeepSeek receives exactly what the user typed.
     """
     messages = _bound_messages(messages)
     parts = []
 
-    # System — passed through as-is, nothing added.
+    # System — passed through as-is.
     if system:
         parts.append(f"<system>\n{system}\n</system>")
 
-    # Tool schema
-    if tools:
-        parts.append(tools_to_xml(tools))
-
-    # Conversation turns
+    # Conversation turns — text only, tools/tool_results skipped.
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
 
         if role == "user":
-            # content can be a list of blocks (text + tool_result)
             if isinstance(content, list):
                 text_parts = []
                 for block in content:
-                    btype = block.get("type", "")
-                    if btype == "text":
+                    if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
-                    elif btype == "tool_result":
-                        tool_use_id = block.get("tool_use_id", "")
-                        result_content = block.get("content", "")
-                        if isinstance(result_content, list):
-                            result_content = "\n".join(
-                                b.get("text", "") for b in result_content
-                                if isinstance(b, dict) and b.get("type") == "text"
-                            )
-                        text_parts.append(
-                            f"<tool_result tool_use_id=\"{tool_use_id}\">\n{result_content}\n</tool_result>"
-                        )
+                    # tool_result blocks are intentionally skipped
                 content = "\n".join(text_parts)
             parts.append(f"Human: {content}")
 
@@ -453,1136 +401,42 @@ def build_prompt(system: str, messages: list, tools: list) -> str:
             if isinstance(content, list):
                 text_parts = []
                 for block in content:
-                    btype = block.get("type", "")
-                    if btype == "text":
+                    if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
-                    elif btype == "tool_use":
-                        tool_json = json.dumps({
-                            "name":  block.get("name", ""),
-                            "id":    block.get("id", ""),
-                            "input": block.get("input", {}),
-                        }, indent=2)
-                        text_parts.append(f"<tool_use>\n{tool_json}\n</tool_use>")
+                    # tool_use blocks are intentionally skipped
                 content = "\n".join(text_parts)
             parts.append(f"Assistant: {content}")
 
     parts.append("Assistant:")
     return "\n\n".join(parts)
 
-# ── Response parser: plain text → Anthropic content blocks ───────────────────
+# ── Response: plain text → Anthropic content blocks ──────────────────────────
 
-# Known DeepSeek native tag names -> Claude Code Anthropic tool names.
-# DeepSeek may emit its own XML tags (e.g. <Bash>, <Editor>) which we map
-# to the exact tool names Claude Code expects.
-DEEPSEEK_TAG_TO_TOOL = {
-    # Shell / file ops
-    "bash":                        "Bash",
-    "read":                        "Read",
-    "write":                       "Write",
-    "edit":                        "Edit",
-    "multiedit":                   "MultiEdit",
-    "read_file":                   "Read",
-    "write_file":                  "Write",
-    # DeepSeek native equivalents
-    "python":                      "Bash",
-    "editor":                      "Edit",
-    "str_replace_based_edit_tool": "Edit",
-    # Search
-    "grep":                        "Grep",
-    "glob":                        "Glob",
-    # Background bash management
-    "bashoutput":                  "BashOutput",
-    "killbash":                    "KillBash",
-    # Todo list / slash commands
-    "todowrite":                   "TodoWrite",
-    "slashcommand":                "SlashCommand",
-    # Web
-    "webfetch":                    "WebFetch",
-    "websearch":                   "WebSearch",
-    # Agent / sub-tasks
-    "agent":                       "Agent",
-    # Task management
-    "taskcreate":                  "TaskCreate",
-    "taskupdate":                  "TaskUpdate",
-    "tasklist":                    "TaskList",
-    "taskget":                     "TaskGet",
-    # Scheduling / monitoring
-    "croncreate":                  "CronCreate",
-    "cronlist":                    "CronList",
-    "crondelete":                  "CronDelete",
-    "monitor":                     "Monitor",
-    "schedulewakeup":              "ScheduleWakeup",
-    # Notifications
-    "pushnotification":            "PushNotification",
-    # Notebook
-    "notebookedit":                "NotebookEdit",
-    "notebookread":                "NotebookRead",
-    # Misc Claude Code tools
-    "skill":                       "Skill",
-    "workflow":                    "Workflow",
-    "enterplanmode":               "EnterPlanMode",
-    "exitplanmode":                "ExitPlanMode",
-    "enterworktree":               "EnterWorktree",
-    "exitworktree":                "ExitWorktree",
-    "askuserquestion":             "AskUserQuestion",
-    "computer":                    "computer",
-}
-
-# All known Claude Code tool names (exact casing) used to recognise native
-# XML tool calls where DeepSeek already uses the correct name.
-CLAUDE_CODE_TOOL_NAMES = set(DEEPSEEK_TAG_TO_TOOL.values()) | {
-    "Bash", "Read", "Write", "Edit", "MultiEdit",
-    "WebFetch", "WebSearch",
-    "Agent",
-    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
-    "CronCreate", "CronList", "CronDelete",
-    "Monitor", "ScheduleWakeup",
-    "PushNotification",
-    "NotebookEdit", "NotebookRead",
-    "Skill", "Workflow",
-    "EnterPlanMode", "ExitPlanMode",
-    "EnterWorktree", "ExitWorktree",
-    "AskUserQuestion",
-    "computer",
-    "str_replace_based_edit_tool",
-}
-
-# XML tags that are structural/metadata or HTML — never treat as tool calls.
-# Stored as lowercase for case-insensitive lookup.
-_SKIP_TAGS = {
-    "system", "tools", "tool", "tool_result", "tool_use",
-    "parameter", "parameters", "name", "description",
-    "thinking", "block", "reason", "decision", "antml",
-    # HTML / markdown fragments DeepSeek may emit
-    "p", "br", "div", "span", "code", "pre", "ul", "ol", "li",
-    "h1", "h2", "h3", "h4", "strong", "em", "b", "i",
-    "a", "img", "table", "tr", "td", "th", "thead", "tbody",
-    "form", "input", "button", "select", "option", "textarea",
-    "html", "head", "body", "meta", "link", "style", "title",
-    # Security/web tags that appear in XSS payloads and pentest output
-    "script", "svg", "iframe", "object", "embed", "frame",
-    "frameset", "applet", "base", "noscript", "template",
-    "math", "marquee", "details", "summary", "video", "audio",
-    # DeepSeek reasoning wrappers
-    # NOTE: "content" intentionally excluded — DeepSeek uses <content> inside
-    # tool call blocks as a parameter wrapper; dropping it breaks tool parsing.
-    "response", "result", "output", "answer",
-}
-
-# Native-tag tool calls for these have real, hard-to-undo side effects
-# (write/overwrite a file, run a shell command). If DeepSeek ever produces a
-# well-formed one of these while narrating/explaining rather than actually
-# intending to act — e.g. demonstrating its own tool syntax mid-explanation —
-# there's no reliable way to tell that apart from a genuine call by shape
-# alone. See _native_call_has_narrative_preamble below: a high-risk native
-# tag preceded by non-trivial prose in the same reply is treated as
-# narration, not a real call, and suppressed instead of executed.
-_HIGH_RISK_NATIVE_TOOLS = {"Write", "Edit", "MultiEdit", "Bash"}
-_LEADING_PROSE_WARN_CHARS = 15
-
-def _strip_json_fences(raw: str) -> str:
-    """Remove markdown code fences DeepSeek sometimes wraps JSON in."""
-    raw = raw.strip()
-    # ```json ... ``` or ``` ... ```
-    m = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    return raw
-
-
-# Valid single-character JSON escape letters (after the leading backslash).
-# JSON spec §7: only these are legal after a backslash inside a string.
-_VALID_JSON_ESC_CHARS = frozenset({'"', '\\', '/', 'b', 'f', 'n', 'r', 't'})
-
-
-def _fix_invalid_json_escapes(s: str) -> str:
+class ResponseHandler:
     """
-    Replace invalid JSON escape sequences in a raw JSON string with
-    valid equivalents so json.loads can parse it.
-
-    JSON only allows: \\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX
-    DeepSeek embeds Python code in JSON strings that may contain Python-style
-    escapes such as \\x00, \\a, \\v, \\0, or \\' — all illegal in JSON.
-
-    Conversion rules (applied at the raw-text level, not per parsed value):
-      \\xNN  →  \\u00NN   hex escape  → JSON unicode escape (value preserved)
-      \\uXXXX             already valid, left untouched
-      any other \\<c>    →  \\\\<c>  escape the backslash, emit <c> literally
-
-    This function is a no-op when the input contains no invalid escapes, so
-    it is safe to call eagerly on all inputs.
-    """
-    out: list[str] = []
-    i = 0
-    n = len(s)
-    while i < n:
-        ch = s[i]
-        if ch != '\\' or i + 1 >= n:
-            out.append(ch)
-            i += 1
-            continue
-        nxt = s[i + 1]
-        if nxt in _VALID_JSON_ESC_CHARS:
-            # Valid single-char escape — keep as-is
-            out.append(ch)
-            out.append(nxt)
-            i += 2
-        elif nxt == 'u' and i + 5 <= n and all(
-                c in '0123456789abcdefABCDEF' for c in s[i + 2: i + 6]):
-            # Valid \uXXXX — keep as-is
-            out.append(s[i: i + 6])
-            i += 6
-        elif nxt == 'x' and i + 3 < n and all(
-                c in '0123456789abcdefABCDEF' for c in s[i + 2: i + 4]):
-            # \xNN → \u00NN  (Python hex-escape → JSON unicode escape)
-            out.append(f'\\u00{s[i + 2: i + 4]}')
-            i += 4
-        else:
-            # Invalid escape (\a \v \0 \' etc.) — escape the backslash.
-            # The offending character is emitted normally on the next iteration.
-            out.append('\\\\')
-            i += 1
-    return ''.join(out)
-
-
-def _close_unbalanced_json(s: str) -> str | None:
-    """
-    String/escape-aware brace-and-bracket closer. Walks the text tracking
-    whether we're inside a JSON string (honoring backslash escapes) and
-    keeps a stack of {/[ seen OUTSIDE of strings. If anything is left open
-    at the end, returns `s` with the missing closers appended (innermost
-    first). Returns None if nothing is open (nothing to fix) or if the
-    imbalance is implausibly large (>10 — at that point this probably isn't
-    truncated JSON, and guessing a matching close for it is more likely to
-    produce a garbage tool call than a correct one).
-
-    Unlike Attempt 3's plain fixed.count("{") - fixed.count("}"), this
-    doesn't get confused by braces that happen to appear inside string
-    values (e.g. a "content" field containing actual code), since those are
-    skipped while in_string is True.
-    """
-    stack: list[str] = []
-    in_string = False
-    escape = False
-    for ch in s:
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch in "{[":
-            stack.append("}" if ch == "{" else "]")
-        elif ch in "}]":
-            if stack and stack[-1] == ch:
-                stack.pop()
-    if not stack or len(stack) > 10:
-        return None
-    return s + "".join(reversed(stack))
-
-
-def _parse_json_tool(raw: str) -> dict | None:
-    """
-    Try to parse a JSON tool-use block. Handles:
-      - plain JSON
-      - markdown-fenced JSON (```json ... ```)
-      - truncated/partial JSON (best-effort repair)
-    Returns a tool_use block dict or None on failure.
-    """
-    cleaned = _strip_json_fences(raw)
-    _original_cleaned = cleaned  # kept for the failure log at the bottom
-
-    # Pre-pass: fix invalid JSON escape sequences before any parse attempt.
-    # DeepSeek embeds Python code in JSON strings, and Python uses \x00, \a,
-    # \v, \' etc. which are not legal JSON escapes — json.loads raises
-    # "Invalid \escape" and every repair attempt below also fails.
-    # _fix_invalid_json_escapes is a no-op on already-valid JSON so applying
-    # it eagerly here is safe; all subsequent attempts use the cleaned form.
-    _escape_fixed = _fix_invalid_json_escapes(cleaned)
-    if _escape_fixed != cleaned:
-        print("[tool_parse] pre-fixed invalid JSON escape sequences", flush=True)
-        cleaned = _escape_fixed
-
-    # Attempt 1: straight parse
-    try:
-        obj = json.loads(cleaned)
-        return obj
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 1b: unwrap a duplicated <tool_use> open tag. DeepSeek sometimes
-    # emits a SECOND literal "<tool_use>" as the value of "name" instead of
-    # just writing the inner call directly, e.g.:
-    #   {"name": "<tool_use>
-    #   {"name": "Bash", "input": {...}}
-    # Only one closing </tool_use> ever follows, so parse_response's
-    # non-greedy match captures both layers as one blob — the outer "name"
-    # string is unterminated, so a straight parse fails outright and none of
-    # the repairs below (trailing commas / unclosed braces / missing outer
-    # braces) apply, since this isn't truncated or malformed JSON, it's a
-    # duplicated wrapper around otherwise-valid JSON. Strip the corrupt
-    # prefix and parse what's actually the real inner call.
-    m_dup = re.match(r'^\{\s*"name"\s*:\s*"<tool_use>\s*', cleaned)
-    if m_dup:
-        obj = _parse_json_tool(cleaned[m_dup.end():])
-        if obj is not None:
-            print(f"[tool_parse] unwrapped duplicated <tool_use> open tag: {repr(cleaned[:80])}", flush=True)
-            return obj
-
-    # Attempt 1c: same duplication, but written as a literal second opening
-    # tag rather than embedded inside the JSON string value, e.g.:
-    #   <tool_use><tool_use>{"name": "Bash", "input": {...}}</tool_use></tool_use>
-    # The outer scan's non-greedy match stops at the FIRST </tool_use>, so
-    # what reaches here is a dangling leading "<tool_use>" in front of
-    # otherwise-valid JSON — strip it and parse what's left.
-    m_lit = re.match(r'^<tool_use>\s*', cleaned)
-    if m_lit:
-        obj = _parse_json_tool(cleaned[m_lit.end():])
-        if obj is not None:
-            print(f"[tool_parse] stripped literal duplicated <tool_use> open tag: {repr(cleaned[:80])}", flush=True)
-            return obj
-
-    # Attempt 2: Remove trailing commas
-    try:
-        fixed = re.sub(r",\s*([}\]])", r"\1", cleaned)
-        obj = json.loads(fixed)
-        print(f"[tool_parse] fixed trailing commas: {repr(cleaned[:80])}", flush=True)
-        return obj
-    except json.JSONDecodeError:
-        pass
-    
-    # Attempt 3: Fix unclosed braces/brackets (careful with strings containing braces)
-    try:
-        fixed = re.sub(r",\s*([}\]])", r"\1", cleaned)
-        last_char = fixed.rstrip()[-1:] if fixed.rstrip() else ""
-        
-        # Count brace imbalances
-        open_braces = fixed.count("{") - fixed.count("}")
-        open_brackets = fixed.count("[") - fixed.count("]")
-        
-        # Only repair if:
-        # 1. There's a small imbalance (≤3)
-        # 2. Last char isn't already a closer (suggests truncation)
-        # 3. The string doesn't look like it contains code with braces
-        if (0 < open_braces <= 3 or 0 < open_brackets <= 3) and last_char not in "}]":
-            # Check if it looks like truncated JSON (not code with braces)
-            if '"' in fixed or "'" in fixed:  # Has string delimiters
-                fixed += "]" * max(0, open_brackets) + "}" * max(0, open_braces)
-                obj = json.loads(fixed)
-                print(f"[tool_parse] repaired unclosed braces/brackets: {repr(cleaned[:80])}", flush=True)
-                return obj
-    except (json.JSONDecodeError, IndexError):
-        pass
-
-    # Attempt 3b: string/escape-aware close for the shape Attempt 3's
-    # last-char heuristic rejects. Attempt 3 refuses to repair whenever the
-    # payload already ends in "}" or "]" (its signal for "not truncated").
-    # But that's exactly what a real truncated tool call looks like when
-    # generation is cut off right after an inner value closes but before
-    # the outer object does, e.g.:
-    #     {"name": "Bash", "input": {"command": "ls -la"}
-    # (the inner "input" object is balanced; only the outer object is
-    # still open — the string ends in "}" and Attempt 3 gives up.) This is
-    # the main real-world case _fix_dangling_unclosed_tool_use above exists
-    # to catch, so without this attempt that repair only fixes the tag
-    # wrapper and the inner JSON still fails to parse.
-    try:
-        fixed = re.sub(r",\s*([}\]])", r"\1", cleaned)
-        closed = _close_unbalanced_json(fixed)
-        if closed is not None:
-            obj = json.loads(closed)
-            print(f"[tool_parse] repaired unclosed braces/brackets (string-aware): {repr(cleaned[:80])}", flush=True)
-            return obj
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 4: Handle case where JSON is missing outer braces but has "name" and "input"
-    try:
-        # Pattern: "name": "ToolName", "input": {...}
-        if '"name"' in cleaned and '"input"' in cleaned and not cleaned.strip().startswith("{"):
-            fixed = "{" + cleaned + "}"
-            fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
-            obj = json.loads(fixed)
-            print(f"[tool_parse] added missing outer braces: {repr(cleaned[:80])}", flush=True)
-            return obj
-    except json.JSONDecodeError:
-        pass
-    
-    print(f"[tool_parse] failed to parse JSON: {repr(_original_cleaned[:120])}", flush=True)
-    return None
-
-
-def _default_param_key(tool_name: str) -> str:
-    """Return the single-param key name for a genuinely single-param tool."""
-    mapping = {
-        "Bash":         "command",
-        "Read":         "file_path",
-        "NotebookRead": "file_path",
-        "WebFetch":     "url",
-        "WebSearch":    "query",
-    }
-    return mapping[tool_name]
-
-
-# Tools where an unstructured tag body can safely become one parameter.
-# Multi-param tools (Write, Edit, MultiEdit, ...) can't be guessed this way —
-# stuffing raw content into a single field (e.g. a whole file body into
-# "file_path") produces a tool call that's wrong in a confusing, hard-to-
-# diagnose way rather than cleanly missing. For those, an unstructured tag
-# is treated as unparseable instead of guessed.
-_SINGLE_PARAM_TOOLS = {"Bash", "Read", "NotebookRead", "WebFetch", "WebSearch"}
-
-
-def parse_native_tag(tag_name: str, inner: str, valid_tools: set[str] | None = None) -> dict | None:
-    """
-    Convert a DeepSeek native XML tool call like:
-      <Bash><command>ls -la</command></Bash>
-    into an Anthropic tool_use block, or None if the tag should be skipped.
-
-    Resolution order:
-      1. Exact match in CLAUDE_CODE_TOOL_NAMES (preserves casing e.g. "WebFetch")
-      2. Lowercase lookup in DEEPSEEK_TAG_TO_TOOL
-      3. If valid_tools provided and resolved name not in it → skip (return None)
-      4. Fall back to tag name verbatim
-
-    Sub-tag extraction handles:
-      - Simple:  <command>ls -la</command>
-      - Nested:  <content><![CDATA[...]]></content>  (CDATA unwrapped)
-      - Mixed content with attributes ignored gracefully
-    """
-    if tag_name in CLAUDE_CODE_TOOL_NAMES:
-        tool_name = tag_name
-    else:
-        tool_name = DEEPSEEK_TAG_TO_TOOL.get(tag_name.lower())
-        if tool_name is None:
-            # Unknown tag — only accept if it's in the valid tool set
-            if valid_tools and tag_name not in valid_tools:
-                return None
-            tool_name = tag_name
-
-    # Reject if not in the caller's tool list (prevents hallucinated tool names)
-    if valid_tools and tool_name not in valid_tools:
-        print(f"[tool_parse] dropping unknown tool '{tool_name}' (not in valid_tools)", flush=True)
-        return None
-
-    # ── Extract sub-tag parameters ───────────────────────────────────────────
-    params: dict[str, str] = {}
-
-    # Unwrap CDATA sections first
-    inner_clean = re.sub(r"<!\[CDATA\[(.*?)]]>", r"\1", inner, flags=re.DOTALL)
-
-    # Match immediate child tags. Uses non-greedy for the value but this is
-    # sufficient for tool params — pathological cases (file content containing
-    # </paramname>) are handled by the CDATA unwrap above.
-    # Attributes on child tags (e.g. <file_path encoding="utf-8">) are ignored
-    # via (?:\s[^>]*)? — the attribute content is stripped.
-    for m in re.finditer(r"<(\w+)(?:\s[^>]*)?>(.*?)</\1>", inner_clean, re.DOTALL):
-        key = m.group(1)
-        val = m.group(2).strip()
-        # Unwrap nested CDATA inside param values
-        val = re.sub(r"<!\[CDATA\[(.*?)]]>", r"\1", val, flags=re.DOTALL)
-        params[key] = val
-
-    # If inner looks like raw JSON (DeepSeek sometimes puts JSON inside the tag)
-    if not params and inner_clean.strip().startswith("{"):
-        try:
-            obj = json.loads(inner_clean.strip())
-            if isinstance(obj, dict):
-                params = {k: (json.dumps(v) if not isinstance(v, str) else v)
-                          for k, v in obj.items()}
-        except json.JSONDecodeError:
-            pass
-
-    # Fallback: treat whole inner content as the primary parameter — but only
-    # for tools where that's actually safe (a real single required param).
-    # For multi-param tools, guessing which one field to stuff unstructured
-    # content into produces a tool call that's wrong in a confusing way
-    # (e.g. a whole file body ending up as "file_path"), so treat it as
-    # unparseable instead — the raw tag falls through as plain text rather
-    # than triggering a tool call with garbage params.
-    if not params:
-        if tool_name in _SINGLE_PARAM_TOOLS:
-            params[_default_param_key(tool_name)] = inner_clean.strip()
-        else:
-            print(
-                f"[tool_parse] '{tool_name}' has no parsable sub-tags and isn't a "
-                f"single-param tool — treating tag as unparseable",
-                flush=True,
-            )
-            return None
-
-    return {
-        "type":  "tool_use",
-        "id":    f"toolu_{uuid.uuid4().hex[:16]}",
-        "name":  tool_name,
-        "input": params,
-    }
-
-
-def _native_call_has_narrative_preamble(tool_name: str, tag_name: str, full_text: str, match_start: int) -> bool:
-    """
-    A native-tag call (<Bash>, <Write>, etc.) for a tool with real side
-    effects, preceded by non-trivial prose in the same reply, is
-    indistinguishable here from DeepSeek demonstrating its own tool syntax
-    mid-explanation rather than actually intending the action (see
-    _HIGH_RISK_NATIVE_TOOLS above). Suppressing it (rather than executing)
-    is the safer failure mode: the caller falls back to treating it as
-    plain text instead of silently running a side-effecting command that
-    may only have been an illustrative example.
-    """
-    if tool_name not in _HIGH_RISK_NATIVE_TOOLS:
-        return False
-    leading = full_text[:match_start].strip()
-    if len(leading) > _LEADING_PROSE_WARN_CHARS:
-        print(
-            f"[tool_parse] suppressing native <{tag_name}> call to high-risk "
-            f"tool '{tool_name}' — {len(leading)} chars of narrative text "
-            f"precede it in the same reply, treating it as text instead of "
-            f"executing it. This shape is consistent with DeepSeek "
-            f"demonstrating tool syntax rather than intending the action. "
-            f"Leading text (last 200 chars): {leading[-200:]!r}",
-            flush=True,
-        )
-        return True
-    return False
-
-
-def strip_premature_exit_preambles(text: str) -> str:
-    """
-    Remove "I will now...", "Let me check...", etc. phrases that appear
-    BEFORE a tool call. These are announcements without execution.
-    
-    Only strips if they appear at the start of the text and are followed
-    by a tool call (not standalone).
-    """
-    # Patterns that indicate the model is announcing intent without executing
-    preamble_patterns = [
-        r"^(?:Now\s+)?(?:let me|let's|I'll|I will)\s+(?:check|run|execute|look at|examine|read|write|edit|search|fetch)\s+[^\n]*?\n+(?=<tool_use>|<\w+>)",
-        r"^(?:I'm|I am)\s+(?:going to|about to)\s+(?:check|run|execute|look at|examine|read|write|edit|search|fetch)\s+[^\n]*?\n+(?=<tool_use>|<\w+>)",
-        r"^(?:First|Next),?\s+(?:let me|I'll|I will)\s+(?:check|run|execute|look at|examine|read|write|edit|search|fetch)\s+[^\n]*?\n+(?=<tool_use>|<\w+>)",
-    ]
-    
-    for pattern in preamble_patterns:
-        text = re.sub(pattern, "", text, flags=re.IGNORECASE | re.MULTILINE)
-
-    return text
-
-
-def strip_fabricated_continuation(text: str) -> str:
-    """
-    DeepSeek sometimes fabricates the tool result and keeps going after the
-    tool call block. Cut at the EARLIEST fabrication marker found.
-    Applied ONLY after a real tool call has been found.
-    """
-    markers = [
-        "\nAssistant:", "\nHuman:",
-        "\n\nThe result", "\n\nOutput:",
-        "\n\nResult:", "\n\nResponse:",
-        "\n<tool_result",          # DeepSeek hallucinating its own tool_result
-        "\n<tool_use_error",       # DeepSeek hallucinating error responses
-        "\nObservation:",          # ReAct-style fabrication
-        "\nHuman: <tool_result>",
-        "\nHuman: <tool_use_error>",
-        "\n\nThe output is",       # Common fabrication phrase
-        "\n\nThe command returned", # Common fabrication phrase
-    ]
-    earliest = len(text)
-    for marker in markers:
-        idx = text.find(marker)
-        if idx != -1 and idx < earliest:
-            earliest = idx
-    return text[:earliest].strip()
-
-
-def _append_text(blocks: list, text: str) -> None:
-    """Append text to last text block (merge) or create a new one."""
-    if not text:
-        return
-    if blocks and blocks[-1].get("type") == "text":
-        blocks[-1]["text"] += text
-    else:
-        blocks.append({"type": "text", "text": text})
-
-
-def _find_first_tool_call_end(text: str) -> int:
-    """
-    Position just after the first genuine tool-call closing tag, in
-    whichever format DeepSeek used — the plain <tool_use> wrapper or a
-    native XML tag matching a known tool name/alias (e.g. </Bash>).
-    Returns -1 if no real tool call is found.
-
-    Callers must run this AFTER normalizing the <tool_call name="X"> and
-    DeepSeek-V3 special-token formats into <tool_use> — otherwise a real
-    tool call still in one of those other formats won't be recognized,
-    and the fabrication-stripping scoped to "after the first real tool
-    call" would wrongly treat none as having happened yet.
-    """
-    candidates = []
-    idx = text.find("</tool_use>")
-    if idx != -1:
-        candidates.append(idx + len("</tool_use>"))
-    for m in re.finditer(r"</(\w+)>", text):
-        tag = m.group(1)
-        if tag in CLAUDE_CODE_TOOL_NAMES or tag.lower() in DEEPSEEK_TAG_TO_TOOL:
-            candidates.append(m.end())
-    return min(candidates) if candidates else -1
-
-
-def _fix_missing_opening_tool_use_tag(text: str) -> str:
-    """
-    Repair a reply that contains one or more literal </tool_use> closing
-    tags but NO opening <tool_use> tag anywhere — e.g.:
-
-        </tool_use>
-        {"name": "Bash", "input": {...}}
-        </tool_use>
-
-    or simply:
-
-        {"name": "Bash", "input": {...}}
-        </tool_use>
-
-    The main scan in parse_response requires a literal opening tag to match
-    anything at all, so without this repair a reply shaped like this never
-    matches and the whole thing — including a genuine, parseable tool call —
-    falls through as inert text.
-
-    Conservative by construction: only rewrites when (a) no real opening tag
-    exists anywhere in the text, and (b) the JSON sitting immediately before
-    the last closing tag actually parses as a tool-call object with a
-    "name" key. Anything else is left untouched rather than guessed at.
-    """
-    if "<tool_use>" in text:
-        return text  # a real opening tag exists — not this case
-
-    closes = list(re.finditer(r"</tool_use>", text))
-    if not closes:
-        return text
-
-    # The real payload sits before the LAST closing tag — that's DeepSeek's
-    # actual intended close. Anything before an earlier closing tag (a
-    # stray/hallucinated one) is discarded, mirroring what a genuine
-    # <tool_use>...</tool_use> block would keep (just its own inner text).
-    last_close = closes[-1]
-    head = text[:last_close.start()]
-    tail = text[last_close.end():]
-
-    search_from = closes[-2].end() if len(closes) > 1 else 0
-    brace_idx = head.find("{", search_from)
-    if brace_idx == -1:
-        return text  # no JSON-looking payload here — leave untouched
-
-    prose = head[:brace_idx]
-    json_candidate = head[brace_idx:].strip()
-    obj = _parse_json_tool(json_candidate)
-    if not isinstance(obj, dict) or "name" not in obj:
-        return text  # doesn't parse as a tool call — leave untouched
-
-    print(
-        f"[tool_parse] repaired reply missing opening <tool_use> tag "
-        f"({len(closes)} closing tag(s) found, 0 opening): "
-        f"{repr(json_candidate[:80])}",
-        flush=True,
-    )
-    return f"{prose}<tool_use>\n{json_candidate}\n</tool_use>{tail}"
-
-
-def _fix_dangling_unclosed_tool_use(text: str) -> str:
-    """
-    Repair a reply that has an opening <tool_use> with no matching close —
-    typically because generation was cut off mid-call (token limit, stream
-    truncation cutting off before the model emitted "</tool_use>"). Without
-    this, the main scan below requires a literal closing tag to match
-    anything at all, so a truncated-but-otherwise-real call is silently
-    dropped and NO tool_use block is ever produced for it.
-
-    Conservative by construction: only looks at the LAST <tool_use> open in
-    the text (any earlier ones are assumed already closed and handled by the
-    normal scan), only fires if there is no closing tag anywhere after it,
-    and only if what follows actually looks like a JSON object (starts with
-    "{"). We don't try to validate/repair the JSON itself here — that's what
-    _parse_json_tool's existing brace-imbalance repair (Attempt 3) is for;
-    this function's only job is making sure the tag wrapper is well-formed
-    enough for the main scan to find it in the first place.
-    """
-    opens = [m.end() for m in re.finditer(r"<tool_use>", text)]
-    if not opens:
-        return text
-    last_open = opens[-1]
-    if "</tool_use>" in text[last_open:]:
-        return text  # already closes properly somewhere — not this case
-
-    payload = text[last_open:].strip()
-    if not payload.startswith("{"):
-        return text  # doesn't look like a JSON payload — leave untouched
-
-    print(
-        f"[tool_parse] repaired dangling unclosed <tool_use> "
-        f"(likely truncated generation): {repr(payload[:80])}",
-        flush=True,
-    )
-    return text[:last_open] + payload + "</tool_use>"
-
-
-def _find_balanced_tag(text: str, tag: str, start: int) -> tuple[int, int] | None:
-    """
-    Find a balanced <tag>...</tag> span with the opening tag starting at
-    `start`, correctly handling same-name NESTING by counting depth instead
-    of stopping at the first closing tag of that name (which is what a
-    non-greedy regex with a backreference does, and which mis-closes on the
-    inner tag when the model nests a tag inside itself).
-
-    Returns (inner_start, inner_end) — the span strictly between the
-    matched opening and closing tags — or None if `start` isn't an opening
-    tag for `tag`, or no balancing close exists (unbalanced/truncated).
-    """
-    open_re = re.compile(rf"<{re.escape(tag)}>")
-    close_re = re.compile(rf"</{re.escape(tag)}>")
-    m = open_re.match(text, start)
-    if not m:
-        return None
-    depth = 1
-    pos = inner_start = m.end()
-    while depth > 0:
-        nxt_open = open_re.search(text, pos)
-        nxt_close = close_re.search(text, pos)
-        if not nxt_close:
-            return None  # unbalanced — no matching close at this depth
-        if nxt_open and nxt_open.start() < nxt_close.start():
-            depth += 1
-            pos = nxt_open.end()
-        else:
-            depth -= 1
-            pos = nxt_close.end()
-            if depth == 0:
-                return inner_start, nxt_close.start()
-    return None  # pragma: no cover — loop always returns or hits the unbalanced case above
-
-
-# Recognizes either the literal "tool_use" wrapper or a native "<TagName>"
-# tag. Order matters: alternation tries "tool_use" first, so a literal
-# <tool_use> tag is always classified as such rather than falling through
-# to the generic native-tag branch (which would also technically match it).
-_OPEN_TAG_RE = re.compile(r"<(tool_use|[A-Za-z]\w*)>")
-
-
-def _iter_tool_matches(text: str):
-    """
-    Depth-aware replacement for the old single non-greedy regex scan.
-    Yields dicts {start, end, tag, inner} for each top-level, properly
-    balanced <tool_use>...</tool_use> or <NativeTag>...</NativeTag> span,
-    left to right, non-overlapping — same contract as re.finditer, but
-    using _find_balanced_tag so same-name nesting closes on the correct
-    (outermost) matching tag instead of the first one encountered.
-
-    An opening tag with no balancing close (still-unbalanced after the
-    dangling-tag repairs above) is simply skipped — its "<...>" text is
-    left for the caller to treat as ordinary text, same as if it had never
-    matched under the old regex-based scan.
-    """
-    pos = 0
-    n = len(text)
-    while pos < n:
-        m = _OPEN_TAG_RE.search(text, pos)
-        if not m:
-            return
-        tag = m.group(1)
-        span = _find_balanced_tag(text, tag, m.start())
-        if span is None:
-            pos = m.end()  # unbalanced open — skip it, keep scanning after
-            continue
-        inner_start, inner_end = span
-        close_end = inner_end + len(f"</{tag}>")
-        yield {"start": m.start(), "end": close_end, "tag": tag, "inner": text[inner_start:inner_end]}
-        pos = close_end
-
-
-def parse_response(text: str, valid_tools: set[str] | None = None) -> list:
-    """
-    Parse DeepSeek reply into Anthropic content blocks.
-
-    Handles three tool-call formats emitted by DeepSeek:
-      1. Injected JSON format:   <tool_use>{"name":…,"input":…}</tool_use>
-      2. DeepSeek native XML:    <Bash><command>…</command></Bash>
-      3. Fenced JSON in tool_use:<tool_use>```json{…}```</tool_use>
-
-    Key behaviours:
-      - Text BETWEEN tool calls is preserved (not dropped after first tool).
-      - Text AFTER a tool call is stripped (fabricated results/continuations).
-      - Multiple tool calls in one response all survive.
-      - Unknown / skip tags are passed through as literal text.
-      - JSON is repaired when possible (trailing commas, unclosed braces).
-      - valid_tools: set of tool names from the current request; unknown names
-        are dropped rather than forwarded to Claude Code which would error.
-    """
-    blocks: list[dict] = []
-    last = 0
-    last_tool_end: int | None = None  # position just after last confirmed tool match
-
-    # Debug: log full raw text to diagnose tool parsing issues
-    print(f"[parse_response] full raw text ({len(text)} chars):\n{text}\n---END---", flush=True)
-
-    # ── Pre-pass 0: strip premature exit preambles ───────────────────────────
-    # "Now let's check the files" followed by nothing → strip it
-    text = strip_premature_exit_preambles(text)
-
-    # ── Pre-pass 1: <tool_call name="ToolName">{json}</tool_call> ────────────
-    # DeepSeek sometimes uses this format instead of <tool_use> or <ToolName>.
-    # Runs BEFORE fabrication-stripping below, so that format is already
-    # normalized to <tool_use> by the time we need to detect "was there a
-    # real tool call already" — otherwise a genuine tool call still in this
-    # format would be invisible to that check.
-    tool_call_attr_pat = re.compile(
-        r'<tool_call\s+name=["\']?(\w+)["\']?>\s*(.*?)\s*</tool_call>',
-        re.DOTALL,
-    )
-    def _replace_tool_call_attr(m):
-        tool_name = m.group(1).strip()
-        raw_inner = m.group(2).strip()
-        obj = _parse_json_tool(raw_inner)
-        if obj is None:
-            obj = {}
-        # If the JSON itself has an "input" key (full tool-call envelope),
-        # unwrap it rather than nesting {name, input: {name, input: ...}}.
-        if isinstance(obj, dict) and "input" in obj and isinstance(obj["input"], dict):
-            params = obj["input"]
-        elif isinstance(obj, dict) and "name" in obj and set(obj.keys()) <= {"name", "id", "input", "type"}:
-            params = obj.get("input", {}) or {}
-        else:
-            params = obj if isinstance(obj, dict) else {}
-        merged = {"name": tool_name, "id": f"toolu_{uuid.uuid4().hex[:16]}", "input": params}
-        return f"<tool_use>{json.dumps(merged)}</tool_use>"
-    text = tool_call_attr_pat.sub(_replace_tool_call_attr, text)
-
-    # ── Pre-pass 2: DeepSeek-V3 special token format ─────────────────────────
-    # DeepSeek-V3 sometimes emits tool calls as:
-    #   <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>
-    #   type\nfunction
-    #   <｜tool▁sep｜>
-    #   TOOL_NAME
-    #   ```json
-    #   {"arg": "value"}
-    #   ```
-    #   <｜tool▁call▁end｜><｜tool▁calls▁end｜>
-    # Convert these to <tool_use>{json}</tool_use> before normal parsing.
-    special_token_pat = re.compile(
-        r"<｜tool▁call▁begin｜>.*?<｜tool▁sep｜>\s*(\w+)\s*```(?:json)?\s*(.*?)```\s*<｜tool▁call▁end｜>",
-        re.DOTALL,
-    )
-    def _replace_special_tokens(m):
-        tool_name = m.group(1).strip()
-        raw_json  = m.group(2).strip()
-        try:
-            params = json.loads(raw_json)
-        except json.JSONDecodeError:
-            params = {"input": raw_json}
-        obj = {"name": tool_name, "id": f"toolu_{uuid.uuid4().hex[:16]}", "input": params}
-        return f"<tool_use>{json.dumps(obj)}</tool_use>"
-    text = special_token_pat.sub(_replace_special_tokens, text)
-    # Strip the outer begin/end wrappers if any remain
-    text = re.sub(r"<｜tool▁calls▁begin｜>|<｜tool▁calls▁end｜>", "", text)
-
-    # ── Pre-pass 3: repair a missing opening <tool_use> tag ──────────────────
-    # Mirror image of the duplicated-OPENING-tag repairs in _parse_json_tool
-    # (m_dup/m_lit) — those fire once the main scan below has already matched
-    # an opening tag. This handles the opposite shape: DeepSeek sometimes
-    # emits a well-formed tool call with NO opening tag at all, e.g.:
-    #   </tool_use>
-    #   {"name": "Bash", "input": {...}}
-    #   </tool_use>
-    # (a stray leading close, then the real call, then its real close) or
-    # just:
-    #   {"name": "Bash", "input": {...}}
-    #   </tool_use>
-    # Without this repair, the main scan's regex requires a literal opening
-    # tag to match anything at all, so text like this never matches ANYWHERE
-    # and the entire reply — including a perfectly valid tool call — falls
-    # through as inert text. Only fires when there's no real opening tag
-    # anywhere in the reply; if one exists, this is not that case and the
-    # normal scan (plus the duplicated-open-tag repairs) handles it.
-    text = _fix_missing_opening_tool_use_tag(text)
-
-    # ── Pre-pass 3b: repair a dangling unclosed <tool_use> (truncated call) ──
-    # Mirror image of pre-pass 3 above: instead of a missing OPEN, this is a
-    # missing CLOSE — the reply ends mid-call because generation was cut off
-    # before "</tool_use>" was emitted. Must run after pre-pass 3 (which only
-    # fires when there's no opening tag anywhere) so the two repairs don't
-    # step on each other, and before the fabrication-stripping pass below so
-    # a real-but-truncated call is normalized before anything else inspects
-    # tool-call boundaries.
-    text = _fix_dangling_unclosed_tool_use(text)
-
-    # ── Pre-pass 4: strip hallucinated conversation continuations ────────────
-    # DeepSeek sometimes emits a real tool call, then keeps going by
-    # fabricating "Human: <tool_result>..." / "Assistant: ..." turns of its
-    # own — worst case, a SECOND tool call based on a result it made up.
-    # Runs AFTER Pre-passes 1-3 so every real tool-call format (<tool_use>,
-    # the <tool_call name="X"> alias, the special-token format, and a
-    # missing-opening-tag reply) has already been normalized to <tool_use>
-    # by this point.
-    #
-    # The two protocol-specific markers below are safe to strip unconditionally
-    # — nobody writes literal "<tool_result>"/"<tool_use_error>" tags in normal
-    # prose. The bare "Human:"/"Assistant:" markers are NOT safe to strip
-    # unconditionally: build_prompt() itself uses those exact role prefixes
-    # ("Human: {content}" / "Assistant: {content}"), so a response that
-    # explains or edits code involving them — e.g. someone working on this
-    # very proxy, or on any chat-formatting code — can legitimately contain
-    # those substrings before any tool call ever appears. Blindly cutting at
-    # the first occurrence would silently destroy a real tool call that
-    # follows. So the bare markers are only searched for AFTER the first
-    # genuine tool-call close (<tool_use>, or a native tag matching a known
-    # tool name/alias, e.g. </Bash>) — i.e. only to catch a fabricated
-    # continuation that follows an already-real tool call, never to truncate
-    # text that precedes (and may contain) the first one.
-    fabrication_markers_always = [
-        "\nHuman: <tool_result>",
-        "\nHuman: <tool_use_error>",
-    ]
-    fabrication_markers_after_tool = [
-        "\n\nHuman:",
-        "\nHuman:",          # single-newline variant
-        "\n\nAssistant:",    # fabricated self-reply
-    ]
-    earliest = len(text)
-    for marker in fabrication_markers_always:
-        idx = text.find(marker)
-        if idx != -1 and idx < earliest:
-            earliest = idx
-    first_tool_close = _find_first_tool_call_end(text)
-    if first_tool_close != -1:
-        for marker in fabrication_markers_after_tool:
-            idx = text.find(marker, first_tool_close)
-            if idx != -1 and idx < earliest:
-                earliest = idx
-    if earliest < len(text):
-        print(f"[pre-pass] stripping hallucinated continuation at pos {earliest}", flush=True)
-        text = text[:earliest]
-
-    # ── Pattern 1: <tool_use>…</tool_use>  (case-sensitive tag)
-    # ── Pattern 2: <NativeName>…</NativeName>  (tag starts with letter, any case)
-    #
-    # We process the text in a single left-to-right scan. For each match:
-    #   • text before the match → appended to blocks (unless we already cut after a tool)
-    #   • tool_use block → parsed as JSON
-    #   • native tag → resolved via DEEPSEEK_TAG_TO_TOOL / CLAUDE_CODE_TOOL_NAMES
-    #   • skip tag  → passed through as text
-
-    # NOTE: deliberately NOT using the depth-aware _iter_tool_matches walk
-    # here, even though it exists above. Tried it — it breaks the existing
-    # duplicate-<tool_use>-wrapper repair (_parse_json_tool's m_dup/m_lit
-    # attempts), which depends on the OLD shallow non-greedy-regex behavior:
-    # for DeepSeek's real "<tool_use><tool_use>{...}</tool_use></tool_use>"
-    # artifact, the shallow scan closes on the FIRST </tool_use> (the inner
-    # one), capturing json_inner = '<tool_use>{...}' with no trailing close
-    # — exactly the shape m_lit expects and strips. A depth-aware matcher
-    # instead correctly finds the true OUTER boundary, which includes the
-    # inner tag's own close inside "inner" — a shape m_lit does NOT handle,
-    # so that (the actually-observed DeepSeek artifact) would regress.
-    # True independent nesting of two intentional same-name calls doesn't
-    # appear in practice, so the old regex scan (which happens to do the
-    # right thing for the artifact that DOES occur) is kept here.
-    combined = re.compile(
-        r"<tool_use>(?P<json_inner>.*?)</tool_use>"
-        r"|<(?P<ntag>[A-Za-z]\w*)>(?P<ninner>.*?)</(?P=ntag)>",
-        re.DOTALL,
-    )
-
-    for m in combined.finditer(text):
-        segment_start = m.start()
-        segment_end   = m.end()
-        tag   = "tool_use" if m.group("json_inner") is not None else m.group("ntag")
-        inner = m.group("json_inner") if m.group("json_inner") is not None else m.group("ninner")
-
-        # ── Text before this match ──────────────────────────────────────────
-        # Only emit text that comes BEFORE any tool call in the segment
-        # that's still "open" (i.e. we haven't yet found a tool here).
-        if last_tool_end is None:
-            # Haven't hit a tool yet → all text before this match is kept
-            before = text[last:segment_start]
-            _append_text(blocks, before)
-        else:
-            # Already past a tool call → do NOT emit text between tools
-            # (it's usually fabricated results or "Now let me do X..." filler).
-            pass
-
-        # Raw matched text (equivalent to the old m.group(0)), computed from
-        # the span since _iter_tool_matches yields dicts, not match objects.
-        matched_text = text[segment_start:segment_end]
-
-        # ── Decide what kind of match this is ───────────────────────────────
-        if tag == "tool_use":
-            # ── Format 1: <tool_use>{json}</tool_use> ───────────────────────
-            raw_inner = inner.strip()
-            obj = _parse_json_tool(raw_inner)
-            if obj and isinstance(obj, dict) and "name" in obj:
-                tool_name = obj.get("name", "")
-                tool_input = obj.get("input", {})
-                # Validate against caller's tool list
-                if valid_tools and tool_name not in valid_tools:
-                    print(f"[tool_parse] dropping unknown tool '{tool_name}' in <tool_use>", flush=True)
-                    _append_text(blocks, matched_text)
-                else:
-                    blocks.append({
-                        "type":  "tool_use",
-                        # Always mint our own id — never trust DeepSeek's. Weaker
-                        # models commonly copy the literal "call_abc123" id from
-                        # the system-prompt example instead of generating a fresh
-                        # one, and duplicate ids across tool_use blocks break
-                        # Claude Code's tool_result -> tool_use_id matching. The
-                        # proxy is the one handing this id to Claude Code in the
-                        # first place, so nothing here ever needs the model's own.
-                        "id":    f"toolu_{uuid.uuid4().hex[:16]}",
-                        "name":  tool_name,
-                        "input": tool_input if isinstance(tool_input, dict) else {},
-                    })
-                    last_tool_end = segment_end
-            else:
-                # Couldn't parse — treat as text
-                _append_text(blocks, matched_text)
-
-        else:
-            # ── Format 2: <NativeTag>…</NativeTag> ──────────────────────────
-            tag_name = tag
-
-            if tag_name.lower() in _SKIP_TAGS:
-                # Structural / HTML tag — pass through as text
-                if last_tool_end is None:
-                    _append_text(blocks, matched_text)
-                # (after a tool call, skip-tag text is dropped as fabrication)
-            else:
-                block = parse_native_tag(tag_name, inner, valid_tools=valid_tools)
-                if block is not None and _native_call_has_narrative_preamble(
-                        block["name"], tag_name, text, segment_start):
-                    # Looks narrated/demonstrated, not intended — treat as text.
-                    if last_tool_end is None:
-                        _append_text(blocks, matched_text)
-                elif block is not None:
-                    blocks.append(block)
-                    last_tool_end = segment_end
-                else:
-                    # Resolved to None → unknown/invalid, treat as text
-                    if last_tool_end is None:
-                        _append_text(blocks, matched_text)
-
-        last = segment_end
-
-    # ── Tail text ────────────────────────────────────────────────────────────
-    tail = text[last:]
-    if tail:
-        if last_tool_end is None:
-            # No tool calls found at all → keep everything
-            _append_text(blocks, tail)
-        else:
-            # Text after the last real tool call → strip fabricated continuation
-            cleaned = strip_fabricated_continuation(tail)
-            if cleaned:
-                # Only keep if it's substantial and doesn't look like a fabricated result
-                _append_text(blocks, cleaned)
-
-    if not blocks:
-        blocks.append({"type": "text", "text": text})
-
-    # ── Fallback: if no tool_use blocks found, try ```json fenced JSON ────────
-    # DeepSeek sometimes emits: ```json\n{"name":"Bash","input":{...}}\n```
-    # Only match explicit ```json fences (not ```javascript, bare ```, etc.)
-    # to avoid misfiring on code examples in explanatory text responses.
-    if not any(b["type"] == "tool_use" for b in blocks):
-        fence_pat = re.compile(r"```json\s*(\{[^`]*?\})\s*```", re.DOTALL)
-        rebuilt: list[dict] = []
-        replaced = False
-        full_text_so_far = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-        last_pos = 0
-        for fm in fence_pat.finditer(full_text_so_far):
-            obj = _parse_json_tool(fm.group(1))
-            if obj and isinstance(obj, dict) and "name" in obj and "input" in obj:
-                tool_name = obj.get("name", "")
-                if not valid_tools or tool_name in valid_tools:
-                    before = full_text_so_far[last_pos:fm.start()]
-                    if before.strip():
-                        rebuilt.append({"type": "text", "text": before})
-                    rebuilt.append({
-                        "type":  "tool_use",
-                        "id":    f"toolu_{uuid.uuid4().hex[:16]}",  # never trust DeepSeek's id — see rationale above
-                        "name":  tool_name,
-                        "input": obj.get("input", {}),
-                    })
-                    last_pos = fm.end()
-                    replaced = True
-        if replaced:
-            tail = full_text_so_far[last_pos:]
-            if tail.strip():
-                rebuilt.append({"type": "text", "text": tail})
-            blocks = rebuilt
-            print(f"[parse_response] fallback fence parser rescued {sum(1 for b in blocks if b['type']=='tool_use')} tool(s)", flush=True)
-
-    # ── Intentionally NO fallback for plain fenced shell code ─────────────────
-    # A ```bash/sh/shell/zsh fence is never treated as a real tool call, even
-    # when "Bash" was offered this turn. It used to be auto-"rescued" into a
-    # real Bash tool_use — but DeepSeek uses that exact fence shape both for
-    # commands it actually wants to run AND for purely illustrative examples
-    # ("Recommended Next Steps: `hydra -l admin -P rockyou.txt ...`") that are
-    # meant for the human to review and run manually, and the two are not
-    # reliably distinguishable from the fence alone. Auto-executing the
-    # illustrative case caused unapproved commands (bruteforce attempts,
-    # credential templates, etc.) to actually run. The system prompt now
-    # forbids DeepSeek from using bash/sh/shell/zsh fences at all — real
-    # execution must go through <tool_use>, and illustrative commands must use
-    # inline backticks or a non-shell fence tag instead — so a ```bash fence
-    # reaching this point is always left as inert display text.
-
-    print(
-        f"[parsed blocks] {[b['type'] + ('/' + b.get('name','')) if b['type'] == 'tool_use' else b['type'] for b in blocks]}",
-        flush=True,
-    )
-    return blocks
-
-
-# ── ToolFilter ────────────────────────────────────────────────────────────────
-# No prompt text, correction messages, or prefill are ever added by this
-# class (or anywhere else in this file) — the prompt built by build_prompt is
-# sent to DeepSeek exactly as-is, once, and whatever comes back is parsed and
-# returned as-is. valid_tools is used only to drop hallucinated tool names
-# from the PARSED OUTPUT (see parse_response) — that's filtering the model's
-# response on the way back, not sending it anything.
-
-class ToolFilter:
-    """
-    Wraps call_deepseek_managed + parse_response.
-    Stores the valid tool names from the current request so parse_response
-    can reject hallucinated tool names before they reach Claude Code.
+    Wraps call_deepseek_managed and returns DeepSeek's raw text as a single
+    Anthropic text content block. No tool parsing, no tool injection.
     """
 
     def __init__(self, tools: list):
-        # Valid tools = ONLY what this specific request offered. Do NOT pad
-        # with the full CLAUDE_CODE_TOOL_NAMES baseline — that used to make
-        # every Claude Code built-in "valid" regardless of what this turn
-        # actually declared, so a tool-restricted subagent (e.g. a read-only
-        # Explore agent given only Read/Grep) could still have a hallucinated
-        # <Edit> or <Bash> native-tag call slip through, defeating the
-        # "prevents hallucinated tool names" guarantee for anything with a
-        # recognized built-in name. CLAUDE_CODE_TOOL_NAMES / DEEPSEEK_TAG_TO_TOOL
-        # are still used elsewhere purely to normalize tag spelling/casing —
-        # membership is what's restricted here.
-        self._valid_tools: set[str] = set()
-        for t in (tools or []):
-            name = t.get("name")
-            if name:
-                self._valid_tools.add(name)
+        pass  # tools are ignored
 
     def call_with_filter(self, session_key: str, prompt: str) -> tuple[str, list]:
         """
-        Single call, no retries: send `prompt` to DeepSeek exactly as given,
-        parse whatever comes back, and return it. Nothing is appended to the
-        prompt and nothing is prepended to the response.
+        Send prompt to DeepSeek, return raw text wrapped in a text block.
         """
         raw_text, _ = call_deepseek_managed(session_key, prompt)
-        blocks = parse_response(raw_text, valid_tools=self._valid_tools)
+        text = raw_text if raw_text else ""
+        blocks = [{"type": "text", "text": text}]
+        print(f"[response] {len(text)} chars returned as plain text block", flush=True)
         return raw_text, blocks
+
+
+# Alias so the rest of the file can still refer to ToolFilter
+ToolFilter = ResponseHandler
+
+
+
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
@@ -1791,10 +645,10 @@ def call_deepseek_managed(session_key: str, prompt: str, _depth: int = 0) -> tup
     return call_deepseek_managed(session_key, prompt, _depth=_depth + 1)
 
 
-def stream_response_as_anthropic(session_key: str, prompt: str, model: str, input_tokens: int, tool_filter: "ToolFilter"):
+def stream_response_as_anthropic(session_key: str, prompt: str, model: str, input_tokens: int, handler: "ResponseHandler"):
     """
-    Calls DeepSeek, collects full response, parses content blocks,
-    then streams them as proper Anthropic SSE events.
+    Calls DeepSeek, collects full response, then streams it as Anthropic SSE events.
+    Always emits a single text block with stop_reason="end_turn".
     """
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -1813,13 +667,10 @@ def stream_response_as_anthropic(session_key: str, prompt: str, model: str, inpu
     })
     yield sse("ping", {"type": "ping"})
 
-    # Collect full response from DeepSeek. This can take a while (PoW solve +
-    # generation), so run it off the generator thread and keep sending SSE
-    # pings while we wait — without this, a slow generation could leave the
-    # stream idle long enough for the client to time out the connection,
-    # which looks exactly like "no tool call happened" from Claude Code's side.
+    # Collect full response from DeepSeek. Run off the generator thread and keep
+    # sending SSE pings while we wait so the client doesn't time out.
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(tool_filter.call_with_filter, session_key, prompt)
+        future = pool.submit(handler.call_with_filter, session_key, prompt)
         while True:
             try:
                 full_text, blocks = future.result(timeout=10)
@@ -1828,25 +679,14 @@ def stream_response_as_anthropic(session_key: str, prompt: str, model: str, inpu
                 yield sse("ping", {"type": "ping"})
 
     output_tokens = max(1, len(full_text.split()))
-    stop_reason   = "end_turn"
 
-    # Merge consecutive text blocks so they stream as one block — avoids
-    # spurious newlines that Claude Code inserts between separate content blocks.
-    merged = []
-    for block in blocks:
-        if block["type"] == "text" and merged and merged[-1]["type"] == "text":
-            merged[-1]["text"] += block["text"]
-        else:
-            merged.append(dict(block))
-    blocks = merged
-
+    # Emit all blocks — ResponseHandler always returns a single text block.
     for idx, block in enumerate(blocks):
         if block["type"] == "text":
             yield sse("content_block_start", {
                 "type": "content_block_start", "index": idx,
                 "content_block": {"type": "text", "text": ""},
             })
-            # Stream text in chunks for responsiveness
             text = block["text"]
             chunk_size = 20
             for i in range(0, len(text), chunk_size):
@@ -1856,30 +696,9 @@ def stream_response_as_anthropic(session_key: str, prompt: str, model: str, inpu
                 })
             yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
 
-        elif block["type"] == "tool_use":
-            stop_reason = "tool_use"
-            yield sse("content_block_start", {
-                "type": "content_block_start", "index": idx,
-                "content_block": {
-                    "type":  "tool_use",
-                    "id":    block["id"],
-                    "name":  block["name"],
-                    "input": {},
-                },
-            })
-            # Stream input as a single JSON delta
-            yield sse("content_block_delta", {
-                "type": "content_block_delta", "index": idx,
-                "delta": {
-                    "type":         "input_json_delta",
-                    "partial_json": json.dumps(block["input"]),
-                },
-            })
-            yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-
     yield sse("message_delta", {
         "type":  "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
         "usage": {"output_tokens": output_tokens},
     })
     yield sse("message_stop", {"type": "message_stop"})
@@ -2000,10 +819,8 @@ def messages():
     body     = request.get_json(force=True)
     msgs     = body.get("messages", [])
     model    = body.get("model", "claude-sonnet-4-20250514")
-    max_tok  = body.get("max_tokens", 8096)
     stream   = body.get("stream", False)
     system   = body.get("system", "")
-    tools    = body.get("tools", [])
 
     # Flatten system to string if it's a list of blocks
     if isinstance(system, list):
@@ -2020,17 +837,18 @@ def messages():
         print("[permission] auto-approving", flush=True)
         return _allow_response(stream, model)
 
-    prompt       = build_prompt(system, msgs, tools)
+    # tools are intentionally ignored — no schema injection, no tool_use output
+    prompt       = build_prompt(system, msgs, tools=[])
     input_tokens = max(1, len(prompt.split()))
-    session_key  = derive_session_key(system, msgs)   # ← per-conversation, not "global"
-    store.get_or_create(session_key)  # ensure session exists
-    tf           = ToolFilter(tools)                # ← filter created per-request
+    session_key  = derive_session_key(system, msgs)
+    store.get_or_create(session_key)
+    handler      = ResponseHandler(tools=[])
 
     if stream:
         def generate():
             lock = enforce_request_pacing(session_key)
             try:
-                yield from stream_response_as_anthropic(session_key, prompt, model, input_tokens, tf)
+                yield from stream_response_as_anthropic(session_key, prompt, model, input_tokens, handler)
             except Exception as e:
                 print(f"[error] {e}", file=sys.stderr)
                 import traceback; traceback.print_exc()
@@ -2044,9 +862,8 @@ def messages():
     # Non-streaming
     lock = enforce_request_pacing(session_key)
     try:
-        full_text, blocks = tf.call_with_filter(session_key, prompt)   # ← managed call
-        output_toks  = max(1, len(full_text.split()))
-        stop_reason  = "tool_use" if any(b["type"] == "tool_use" for b in blocks) else "end_turn"
+        full_text, blocks = handler.call_with_filter(session_key, prompt)
+        output_toks = max(1, len(full_text.split()))
     except Exception as e:
         return jsonify({"type": "error", "error": {"type": "api_error", "message": str(e)}}), 500
     finally:
@@ -2058,7 +875,7 @@ def messages():
         "role":          "assistant",
         "content":       blocks,
         "model":         model,
-        "stop_reason":   stop_reason,
+        "stop_reason":   "end_turn",
         "stop_sequence": None,
         "usage":         {"input_tokens": input_tokens, "output_tokens": output_toks},
     })
@@ -2069,7 +886,7 @@ def count_tokens():
     body     = request.get_json(force=True)
     messages = body.get("messages", [])
     system   = body.get("system", "")
-    tools    = body.get("tools", [])
+    tools    = []  # tools are ignored
 
     if isinstance(system, list):
         system = "\n".join(
