@@ -409,6 +409,20 @@ CRITICAL TOOL-CALLING RULES (READ CAREFULLY):
    • If you try to call a non-existent tool, you will get an error
    • Check the tool name spelling EXACTLY
 
+3b. THE "name" FIELD MUST BE A REAL TOOL NAME — NEVER A TAG:
+   The "name" value is one of the exact tool names listed in <tools>
+   (e.g. "Bash", "run_shell") — it is NEVER the literal text "<tool_call>",
+   "<tool_use>", or any other wrapper/tag string. The wrapper tags
+   (<tool_use> ... </tool_use>) go AROUND the JSON object — they are not a
+   value that goes INSIDE it, and they are never repeated as if they were
+   the tool's name.
+   ❌ WRONG: <tool_use>{"name": "<tool_call>", "input": {...}}</tool_use>
+   ❌ WRONG: <tool_use>{"name": "<tool_use>", "input": {...}}</tool_use>
+   ❌ WRONG: <tool_use><tool_use>{"name": "Bash", "input": {...}}</tool_use></tool_use>
+   ✅ CORRECT: <tool_use>{"name": "Bash", "id": "call_abc123", "input": {"command": "ls -la"}}</tool_use>
+   There is exactly ONE opening tag, ONE JSON object with a real tool name,
+   and ONE closing tag — nothing duplicated, nothing nested.
+
 4. WAIT FOR RESULTS:
    • After calling a tool, STOP and wait for the result
    • DO NOT make up or fabricate results
@@ -493,6 +507,9 @@ TOOL_CALL_REMINDER = (
     "command you want run now, use a real <tool_use> block. For a command you are\n"
     "only showing/suggesting, use inline single backticks instead — never a\n"
     "triple-fenced block of any kind.\n"
+    "The JSON \"name\" field must be an exact tool name from <tools> (e.g. \"Bash\") —\n"
+    "never the literal text \"<tool_call>\" or \"<tool_use>\". Those are wrapper tags\n"
+    "that go around the JSON, not a value inside it.\n"
     "</system-reminder>"
 )
 
@@ -740,6 +757,51 @@ def _fix_invalid_json_escapes(s: str) -> str:
     return ''.join(out)
 
 
+def _escape_raw_control_chars(s: str) -> str:
+    """
+    Escape literal newline / carriage-return / tab characters that appear
+    INSIDE a JSON string literal, so json.loads doesn't choke on them.
+
+    JSON strings may only contain a newline as the two-character escape
+    \\n — a literal 0x0A byte inside a quoted string is illegal per the
+    spec, and Python's json.loads (strict mode) raises "Invalid control
+    character" for it. DeepSeek sometimes wraps a long "command" value
+    (e.g. a multi-line `python3 -c "..."` string) across lines in its
+    plain-text output, leaving a raw newline sitting inside the JSON
+    string. _fix_invalid_json_escapes doesn't catch this because there's
+    no leading backslash to key off — this is a bare control byte, not an
+    invalid escape sequence.
+
+    String/escape-aware by construction (mirrors _close_unbalanced_json):
+    walks the text tracking whether we're inside a string and whether the
+    previous char was an unconsumed backslash, and only rewrites control
+    chars found while in_string is True. Left untouched outside strings
+    (e.g. the newline between "role" and the next key) since those don't
+    break parsing and reformatting them would be needlessly invasive.
+
+    No-op when the input has no raw control chars inside strings, so it's
+    safe to call eagerly on all inputs.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    for ch in s:
+        if in_string and not escape and ch in ('\n', '\r', '\t'):
+            out.append({'\n': '\\n', '\r': '\\r', '\t': '\\t'}[ch])
+            continue
+        out.append(ch)
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+    return ''.join(out)
+
+
 def _close_unbalanced_json(s: str) -> str | None:
     """
     String/escape-aware brace-and-bracket closer. Walks the text tracking
@@ -801,6 +863,16 @@ def _parse_json_tool(raw: str) -> dict | None:
     if _escape_fixed != cleaned:
         print("[tool_parse] pre-fixed invalid JSON escape sequences", flush=True)
         cleaned = _escape_fixed
+
+    # Pre-pass: escape literal newline/CR/tab bytes found INSIDE JSON string
+    # literals (e.g. a "command" value DeepSeek wrapped across two lines).
+    # A raw control character in a string is illegal JSON and makes every
+    # attempt below fail identically at the same spot, so this must run
+    # before Attempt 1 — same reasoning as the escape-sequence pre-fix above.
+    _control_fixed = _escape_raw_control_chars(cleaned)
+    if _control_fixed != cleaned:
+        print("[tool_parse] pre-fixed raw control characters inside JSON string", flush=True)
+        cleaned = _control_fixed
 
     # Attempt 1: straight parse
     try:
