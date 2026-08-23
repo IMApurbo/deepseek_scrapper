@@ -369,11 +369,6 @@ def _bound_messages(messages: list) -> list:
 
 def build_prompt(system: str, messages: list, tools: list) -> str:
     """
-    Build a single prompt string from the full conversation history.
-
-    Tools are ignored entirely — no schema is injected, no tool_result or
-    tool_use blocks are formatted. Only plain text content from user and
-    assistant turns is included. DeepSeek receives exactly what the user typed.
     """
     messages = _bound_messages(messages)
     parts = []
